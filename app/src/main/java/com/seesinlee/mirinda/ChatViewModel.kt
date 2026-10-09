@@ -1,4 +1,4 @@
-package com.example.mirinda
+package com.seesinlee.mirinda
 
 import android.net.Uri
 import androidx.compose.runtime.mutableStateListOf

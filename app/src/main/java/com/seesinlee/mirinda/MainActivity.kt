@@ -1,4 +1,4 @@
-package com.example.mirinda
+package com.seesinlee.mirinda
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity

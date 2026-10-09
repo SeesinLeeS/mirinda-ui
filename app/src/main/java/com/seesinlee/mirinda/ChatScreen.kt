@@ -1,4 +1,4 @@
-package com.example.mirinda
+package com.seesinlee.mirinda
 
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -38,6 +38,9 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import coil.compose.AsyncImage
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
 /* ============================================================
  *  配色（深蓝主题）—— 想换色改这里即可
@@ -637,6 +640,6 @@ fun InputBar(
 
 /** 把时间戳格式化为 "MM-dd HH:mm" 显示在历史条目下方 */
 private fun formatTime(ts: Long): String {
-    val sdf = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
-    return sdf.format(java.util.Date(ts))
+    val sdf = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
+    return sdf.format(Date(ts))
 }

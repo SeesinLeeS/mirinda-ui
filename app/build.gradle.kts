@@ -4,13 +4,13 @@ plugins {
 }
 
 android {
-    namespace = "com.example.mirinda"
+    namespace = "com.seesinlee.mirinda"
     compileSdk {
         version = release(37)
     }
 
     defaultConfig {
-        applicationId = "com.example.mirinda"
+        applicationId = "com.seesinlee.mirinda"
         minSdk = 26
         targetSdk = 37
         versionCode = 1
