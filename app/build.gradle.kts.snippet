@@ -1,0 +1,38 @@
+// ================================================================
+// 把下面 dependencies 里缺的几行，合并进你的 app/build.gradle.kts
+// 的 dependencies { } 块中，然后点 Sync Now。
+//
+// 新建的 Empty Activity(Compose) 项目通常已自带大部分 Compose 依赖，
+// 你重点确认 Coil（图片加载）这一行加上了即可。
+// ================================================================
+
+dependencies {
+    // ---- 新建项目一般已自带（没有再加）----
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.6")
+    implementation("androidx.activity:activity-compose:1.9.2")
+    implementation(platform("androidx.compose:compose-bom:2024.09.02"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.ui:ui-tooling-preview")
+    implementation("androidx.compose.material3:material3")
+
+    // ---- ViewModel 在 Compose 中使用（可能需要手动加）----
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.6")
+
+    // ---- 图片加载：必加！用于显示相册选的图 ----
+    implementation("io.coil-kt:coil-compose:2.7.0")
+
+    debugImplementation("androidx.compose.ui:ui-tooling")
+}
+
+// ================================================================
+// 另外确认 android { } 块里开启了 Compose（新建项目默认就有）：
+//
+// android {
+//     buildFeatures {
+//         compose = true
+//     }
+//     // compileSdk 建议 34 或 35
+// }
+// ================================================================
