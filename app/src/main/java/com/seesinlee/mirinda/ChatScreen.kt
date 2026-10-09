@@ -35,12 +35,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import coil.compose.AsyncImage
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 /* ============================================================
  *  配色（深蓝主题）—— 想换色改这里即可
@@ -455,7 +453,7 @@ fun InputBar(
     onRemoveImage: (Uri) -> Unit,
     onSend: (String) -> Unit
 ) {
-    var text by remember { mutableStateOf("") }
+    var text by remember { mutableStateOf(TextFieldValue("")) }
     var isFocused by remember { mutableStateOf(false) }   // 是否聚焦 -> 控制 hover 效果
 
     val maxImages = 9                    // 最多可添加的图片数
@@ -465,12 +463,12 @@ fun InputBar(
         ActivityResultContracts.PickVisualMedia()
     ) { uri -> uri?.let(onPickImage) }
 
-    val canSend = !isLoading && (text.isNotBlank() || pendingImages.isNotEmpty())
+    val canSend = !isLoading && (text.text.isNotBlank() || pendingImages.isNotEmpty())
 
     fun doSend() {
         if (canSend) {
-            onSend(text)
-            text = ""
+            onSend(text.text)
+            text = TextFieldValue("")
         }
     }
 
@@ -573,7 +571,7 @@ fun InputBar(
                             .heightIn(min = 44.dp)
                             .padding(horizontal = 6.dp, vertical = 4.dp)
                     ) {
-                        if (text.isEmpty()) {
+                        if (text.text.isEmpty()) {
                             Text(
                                 text = "有什么想问的…",
                                 style = MaterialTheme.typography.bodyLarge,
@@ -640,6 +638,6 @@ fun InputBar(
 
 /** 把时间戳格式化为 "MM-dd HH:mm" 显示在历史条目下方 */
 private fun formatTime(ts: Long): String {
-    val sdf = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
-    return sdf.format(Date(ts))
+    val sdf = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
+    return sdf.format(java.util.Date(ts))
 }
