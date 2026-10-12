@@ -5,7 +5,8 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.onCompletion
 import kotlinx.coroutines.launch
 import java.util.UUID
 
@@ -15,14 +16,10 @@ import java.util.UUID
  * 它持有：
  *  - messages：当前对话的消息列表（UI 观察它，变了就自动刷新）
  *  - pendingImages：当前"待发送"的图片（显示在输入框上方的预览区）
- *  - availableModels / selectedModel：可选模型（由后端提供）与当前选中的模型
+ *  - availableModels / selectedModel：可选模型与当前选中的模型
  *  - conversations / currentConversationId：对话历史列表与当前所在对话
  *
- * Level 2 接后端时，主要改三处（都已用【后端接入点】标出）：
- *  1. loadModels()  —— 把假模型列表换成从后端拉取
- *  2. loadConversations() —— 把假历史换成从后端拉取
- *  3. sendMessage() —— 把"假回复"换成真正调后端 + 流式接收
- * UI 层基本不用动。
+ * sendMessage() 已接入后端 /agent/send（流式 SSE）。
  */
 class ChatViewModel : ViewModel() {
 
@@ -45,7 +42,7 @@ class ChatViewModel : ViewModel() {
     /** 当前选中的模型 */
     val selectedModel = mutableStateOf<ChatModel?>(null)
 
-    /** 欢迎语（由后端"模型列表接口"一并返回） */
+    /** 欢迎语 */
     val welcomeText = mutableStateOf("")
 
     // ============ 对话历史相关 ============
@@ -56,7 +53,7 @@ class ChatViewModel : ViewModel() {
     /** 当前所在对话的 id */
     val currentConversationId = mutableStateOf<String?>(null)
 
-    /** 各对话对应的消息（内存保存；Level 2 可改成从后端按需加载） */
+    /** 各对话对应的消息（内存保存） */
     private val conversationMessages = mutableMapOf<String, MutableList<ChatMessage>>()
 
     init {
@@ -71,31 +68,23 @@ class ChatViewModel : ViewModel() {
     /**
      * 加载可选模型。
      *
-     * 【后端接入点】Level 2 把下面这段假数据换成真正的后端请求，例如：
-     *   viewModelScope.launch {
-     *       val list = api.getModels()            // Retrofit 调你的后端
-     *       availableModels.clear()
-     *       availableModels.addAll(list)
-     *       selectedModel.value = availableModels.firstOrNull()
-     *   }
+     * 这里的 id 必须与后端 config.yaml 里的 model 名一致，
+     * 因为请求体里的 "model" 字段用的就是它。后端目前支持 "deepseek-flash"。
      */
     private fun loadModels() {
-        val mock = listOf(
-            ChatModel(id = "gpt-4o", name = "GPT-4o", desc = "通用 · 多模态"),
-            ChatModel(id = "gpt-4o-mini", name = "GPT-4o mini", desc = "轻量 · 快速"),
-            ChatModel(id = "qwen-max", name = "通义千问 Max", desc = "中文友好"),
-            ChatModel(id = "claude-3.5", name = "Claude 3.5", desc = "长文本 · 推理")
+        val models = listOf(
+            ChatModel(id = "deepseek-flash", name = "DeepSeek Flash", desc = "深度求索 · 流式")
+            // 以后后端支持更多模型时，在这里继续加（id 要与后端 config 对应）
         )
         availableModels.clear()
-        availableModels.addAll(mock)
+        availableModels.addAll(models)
         // 默认选中第一个
         selectedModel.value = availableModels.firstOrNull()
 
-        // 欢迎语也由"模型列表接口"返回（Level 2 换成后端返回值，例如 resp.welcome）
-        welcomeText.value = "你好～ 点右侧 + 可以插入图片，输入文字后发送试试。\n左上角菜单可切换模型和历史对话。"
+        welcomeText.value = "你好～ 输入文字后发送试试。\n左上角菜单可切换模型和历史对话。"
     }
 
-    /** 生成一段"新对话"的初始消息：带上欢迎语（欢迎语来自模型列表接口） */
+    /** 生成一段"新对话"的初始消息：带上欢迎语 */
     private fun freshConversationMessages(): MutableList<ChatMessage> {
         val list = mutableListOf<ChatMessage>()
         val w = welcomeText.value
@@ -120,19 +109,12 @@ class ChatViewModel : ViewModel() {
     //  对话历史
     // ===================================================================
 
-    /**
-     * 加载对话历史。
-     *
-     * 【后端接入点】Level 2 换成从后端拉取历史列表（以及每段对话的消息）。
-     */
     private fun loadConversations() {
-        // Level 1：开局只有一个新对话
         val first = Conversation(id = newId(), title = "新对话")
         conversations.clear()
         conversations.add(first)
         currentConversationId.value = first.id
 
-        // 新对话带上欢迎语（欢迎语来自模型列表接口）
         conversationMessages[first.id] = freshConversationMessages()
         syncMessagesFromCurrent()
     }
@@ -170,7 +152,6 @@ class ChatViewModel : ViewModel() {
             if (next != null) {
                 currentConversationId.value = next.id
             } else {
-                // 一条都不剩，自动建一个空的新对话
                 val conv = Conversation(id = newId(), title = "新对话")
                 conversations.add(conv)
                 currentConversationId.value = conv.id
@@ -199,18 +180,16 @@ class ChatViewModel : ViewModel() {
     //  图片
     // ===================================================================
 
-    /** 用户选了一张图 -> 加入待发送预览区 */
     fun addPendingImage(uri: Uri) {
         pendingImages.add(uri)
     }
 
-    /** 从待发送预览区移除某张图 */
     fun removePendingImage(uri: Uri) {
         pendingImages.remove(uri)
     }
 
     // ===================================================================
-    //  发送消息
+    //  发送消息（已接入后端 /agent/send 流式 SSE）
     // ===================================================================
 
     /**
@@ -219,48 +198,97 @@ class ChatViewModel : ViewModel() {
      *
      * 流程：
      * 1. 把"文字 + 待发送图片"组装成一条用户消息，加入列表
-     * 2. 清空待发送图片和输入框
-     * 3.（Level 1）用假数据模拟助手 1 秒后回复
-     *    （Level 2 这里换成真正调后端，记得带上 selectedModel.value?.id）
+     * 2. 先插入一条"空的助手消息"占位（isStreaming=true）
+     * 3. 调后端 /agent/send，按 SSE 增量把 token 追加到该助手消息里
+     *
+     * 注意：后端请求体只有 {message, model}，暂不支持图片，
+     * 因此图片只在本地气泡里预览，不会上传。
      */
     fun sendMessage(text: String) {
         if (text.isBlank() && pendingImages.isEmpty()) return
+        if (isLoading.value) return  // 正在请求时不重复发送
 
-        // ---- 组装用户消息的内容块：先放文字（若有），再放所有图片 ----
+        // ---- 组装用户消息：先放文字（若有），再放所有图片 ----
         val blocks = mutableListOf<ContentBlock>()
         if (text.isNotBlank()) blocks.add(ContentBlock.Text(text))
         pendingImages.forEach { blocks.add(ContentBlock.Image(localUri = it)) }
 
         messages.add(ChatMessage(id = newId(), role = Role.USER, blocks = blocks))
 
-        // 如果是对话里的第一条用户消息，用它更新一下该对话标题
+        // 用第一条用户文字更新对话标题
         maybeUpdateTitle(text)
 
-        // 清空待发送区
-        val sentImageCount = pendingImages.size
+        // 清空待发送图片
         pendingImages.clear()
 
-        // ---- 模拟助手回复（Level 1 假数据） ----
-        isLoading.value = true
-        viewModelScope.launch {
-            delay(1000) // 假装在"思考"
-            val modelName = selectedModel.value?.name ?: "未选择模型"
-            val reply = buildString {
-                append("【假回复·$modelName】我收到了你的消息")
-                if (text.isNotBlank()) append("：\"$text\"")
-                if (sentImageCount > 0) append("，以及 $sentImageCount 张图片")
-                append("。\n\n（Level 2 接上后端后，这里会显示模型的真实回复）")
-            }
-            messages.add(
-                ChatMessage(
-                    id = newId(),
-                    role = Role.ASSISTANT,
-                    blocks = listOf(ContentBlock.Text(reply))
-                )
+        val modelId = selectedModel.value?.id ?: "deepseek-flash"
+        val userText = text
+
+        // ---- 插入助手占位消息，用于流式追加 ----
+        val assistantId = newId()
+        messages.add(
+            ChatMessage(
+                id = assistantId,
+                role = Role.ASSISTANT,
+                blocks = listOf(ContentBlock.Text("")),
+                isStreaming = true
             )
-            isLoading.value = false
-            saveMessagesToCurrent()
+        )
+        isLoading.value = true
+
+        // ---- 发起流式请求 ----
+        val reasoning = StringBuilder()
+        val content = StringBuilder()
+
+        viewModelScope.launch {
+            ChatApi.sendStream(userText, modelId)
+                .catch { e ->
+                    // 出错：把错误显示在助手气泡里
+                    val msg = "请求失败：${e.message ?: e.toString()}"
+                    updateAssistant(assistantId, reasoning.toString(), msg, streaming = false)
+                }
+                .onCompletion {
+                    isLoading.value = false
+                    // 结束时取消流式标记，并存档
+                    val idx = messages.indexOfFirst { it.id == assistantId }
+                    if (idx >= 0 && messages[idx].isStreaming) {
+                        messages[idx] = messages[idx].copy(isStreaming = false)
+                    }
+                    saveMessagesToCurrent()
+                }
+                .collect { ev ->
+                    when (ev) {
+                        is ChatApi.StreamEvent.Reasoning -> {
+                            reasoning.append(ev.delta)
+                            updateAssistant(assistantId, reasoning.toString(), content.toString(), streaming = true)
+                        }
+                        is ChatApi.StreamEvent.Token -> {
+                            content.append(ev.delta)
+                            updateAssistant(assistantId, reasoning.toString(), content.toString(), streaming = true)
+                        }
+                    }
+                }
         }
+    }
+
+    /**
+     * 更新助手消息的内容。
+     * 把"思考"和"回复"拆成独立的块：
+     *   - 有推理内容 -> 放一个 Reasoning 块（UI 用可折叠的"深度思考"面板展示）
+     *   - 有正文内容 -> 放一个 Text 块（正式回复，展示在思考面板下方）
+     * 这样就实现了"先思考、再回复"：思考阶段只有 Reasoning 块，
+     * 正文一开始出现，Reasoning 面板会自动折叠（由 UI 根据 isStreaming 控制）。
+     */
+    private fun updateAssistant(id: String, reasoning: String, content: String, streaming: Boolean) {
+        val idx = messages.indexOfFirst { it.id == id }
+        if (idx < 0) return
+
+        val blocks = buildList {
+            if (reasoning.isNotEmpty()) add(ContentBlock.Reasoning(reasoning))
+            if (content.isNotEmpty()) add(ContentBlock.Text(content))
+        }.ifEmpty { listOf(ContentBlock.Text("")) }
+
+        messages[idx] = messages[idx].copy(blocks = blocks, isStreaming = streaming)
     }
 
     /** 用第一条用户文字作为对话标题 */

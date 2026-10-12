@@ -6,6 +6,9 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
@@ -58,6 +61,11 @@ object ChatColors {
     val TextPrimary = Color(0xFFEAF1FF)     // 主文字：近白
     val TextSecondary = Color(0xFF9DB2D6)   // 次要文字：灰蓝
     val Accent = Color(0xFF4A90E2)          // 强调/发送按钮
+
+    // 深度思考面板
+    val ReasoningBg = Color(0xFF16305C)     // 思考面板背景：比页面略亮的深蓝
+    val ReasoningBorder = Color(0xFF2E4D80) // 思考面板边框
+    val ReasoningText = Color(0xFFB9C9E6)   // 思考正文：柔和灰蓝
 }
 
 
@@ -73,9 +81,32 @@ fun ChatScreen(vm: ChatViewModel) {
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
 
-    LaunchedEffect(vm.messages.size) {
-        if (vm.messages.isNotEmpty()) {
-            listState.animateScrollToItem(vm.messages.size - 1)
+    // 流式输出时的"自动滚到底"：
+    // 不能只监听 messages.size（流式是往同一条消息里追加内容，size 不变），
+    // 这里额外用最后一条消息的"文本总长度"作为变化信号。
+    val lastContentSignature = vm.messages.lastOrNull()?.let { m ->
+        m.blocks.sumOf { b ->
+            when (b) {
+                is ContentBlock.Text -> b.text.length
+                is ContentBlock.Reasoning -> b.text.length
+                else -> 0
+            }
+        }
+    } ?: 0
+
+    // 用户是否已经在底部附近（若手动往上翻看历史，就不要把他强行拽回底部）
+    val isNearBottom by remember {
+        derivedStateOf {
+            val info = listState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull() ?: return@derivedStateOf true
+            last.index >= info.totalItemsCount - 2
+        }
+    }
+
+    LaunchedEffect(vm.messages.size, lastContentSignature) {
+        val total = listState.layoutInfo.totalItemsCount
+        if (total > 0 && isNearBottom) {
+            listState.scrollToItem(total - 1)
         }
     }
 
@@ -103,7 +134,7 @@ fun ChatScreen(vm: ChatViewModel) {
                     title = {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text(
-                                "多模态助手",
+                                "Mirinda",
                                 style = MaterialTheme.typography.titleLarge,
                                 color = ChatColors.TextPrimary
                             )
@@ -123,6 +154,19 @@ fun ChatScreen(vm: ChatViewModel) {
             },
             containerColor = ChatColors.PageBg   // 整个页面深蓝背景
         ) { padding ->
+            // 只有在"助手占位消息还一个字都没吐出来"时，才单独显示底部"思考中"动效；
+            // 一旦开始流式输出（推理或正文），就由气泡内的"深度思考"面板接管提示。
+            val lastMsg = vm.messages.lastOrNull()
+            val waitingFirstChunk = vm.isLoading.value &&
+                lastMsg?.role == Role.ASSISTANT &&
+                lastMsg.blocks.all { b ->
+                    when (b) {
+                        is ContentBlock.Text -> b.text.isBlank()
+                        is ContentBlock.Reasoning -> b.text.isBlank()
+                        else -> false
+                    }
+                }
+
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -140,7 +184,7 @@ fun ChatScreen(vm: ChatViewModel) {
                     items(vm.messages, key = { it.id }) { msg ->
                         MessageBubble(msg)
                     }
-                    if (vm.isLoading.value) {
+                    if (waitingFirstChunk) {
                         item { TypingIndicator() }
                     }
                     item { Spacer(Modifier.height(4.dp)) }
@@ -374,12 +418,27 @@ fun MessageBubble(msg: ChatMessage) {
         }
     } else {
         // 助手消息：不包气泡，直接平铺（左对齐，近白文字适配深蓝背景）
+        // 其中"推理块"单独用可折叠的深度思考面板展示，实现"先思考、再回复"。
+        val reasoningBlock = msg.blocks.filterIsInstance<ContentBlock.Reasoning>().firstOrNull()
+        val otherBlocks = msg.blocks.filterNot { it is ContentBlock.Reasoning }
+        val hasReply = otherBlocks.any {
+            (it is ContentBlock.Text && it.text.isNotBlank()) || it is ContentBlock.Image
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(end = 8.dp)
         ) {
-            msg.blocks.forEach { block -> MessageBlock(block, ChatColors.TextPrimary) }
+            if (reasoningBlock != null && reasoningBlock.text.isNotBlank()) {
+                // thinking = 仍在思考且正文还没开始 -> 面板展开并显示"深度思考中…"
+                ReasoningPanel(
+                    text = reasoningBlock.text,
+                    thinking = msg.isStreaming && !hasReply
+                )
+                Spacer(Modifier.height(8.dp))
+            }
+            otherBlocks.forEach { block -> MessageBlock(block, ChatColors.TextPrimary) }
         }
     }
 }
@@ -389,11 +448,15 @@ fun MessageBubble(msg: ChatMessage) {
 private fun MessageBlock(block: ContentBlock, textColor: Color = Color.Unspecified) {
     when (block) {
         is ContentBlock.Text -> {
-            Text(
-                text = block.text,
-                color = textColor,
-                style = MaterialTheme.typography.bodyLarge
+            // 用轻量 Markdown 渲染器解析（粗体/代码块/列表/标题/链接等）
+            MarkdownText(
+                markdown = block.text,
+                color = textColor
             )
+        }
+        is ContentBlock.Reasoning -> {
+            // 正常情况下推理块已在 MessageBubble 里单独处理；这里兜底渲染。
+            ReasoningPanel(text = block.text, thinking = false)
         }
         is ContentBlock.Image -> {
             val model: Any? = block.localUri ?: block.remoteUrl
@@ -436,6 +499,82 @@ fun TypingIndicator() {
             color = ChatColors.TextSecondary,
             style = MaterialTheme.typography.bodyMedium
         )
+    }
+}
+
+
+/**
+ * 深度思考面板（DeepSeek-R1 风格）。
+ *
+ * - thinking=true（仍在思考、正文还没来）：面板默认展开，标题显示"深度思考中…"并带转圈动效。
+ * - thinking=false（正文已开始 / 已结束）：面板自动折叠成一行"已深度思考（点击展开）"，
+ *   想回看思考过程点一下即可展开。
+ */
+@Composable
+fun ReasoningPanel(text: String, thinking: Boolean) {
+    // 展开状态：思考中默认展开；思考结束自动收起（仍可手动点开）
+    var expanded by remember { mutableStateOf(true) }
+    LaunchedEffect(thinking) {
+        expanded = thinking
+    }
+
+    Surface(
+        shape = RoundedCornerShape(12.dp),
+        color = ChatColors.ReasoningBg,
+        border = BorderStroke(1.dp, ChatColors.ReasoningBorder),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+            // ---- 标题行（可点击折叠/展开）----
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable { expanded = !expanded },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (thinking) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = ChatColors.Accent
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "深度思考中…",
+                        color = ChatColors.ReasoningText,
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                } else {
+                    Text("💡", style = MaterialTheme.typography.labelLarge)
+                    Spacer(Modifier.width(6.dp))
+                    Text(
+                        "已深度思考",
+                        color = ChatColors.ReasoningText,
+                        style = MaterialTheme.typography.labelLarge
+                    )
+                }
+                Spacer(Modifier.weight(1f))
+                Icon(
+                    imageVector = if (expanded) Icons.Filled.KeyboardArrowUp
+                    else Icons.Filled.KeyboardArrowDown,
+                    contentDescription = if (expanded) "收起" else "展开",
+                    tint = ChatColors.TextSecondary,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+
+            // ---- 思考正文（可折叠）----
+            AnimatedVisibility(visible = expanded) {
+                Column {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = text,
+                        color = ChatColors.ReasoningText,
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            }
+        }
     }
 }
 
