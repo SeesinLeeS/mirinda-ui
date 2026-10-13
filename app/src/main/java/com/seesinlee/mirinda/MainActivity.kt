@@ -10,18 +10,26 @@ import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 
 /**
- * App 入口（相当于你熟悉的 main）。
- * 这里创建 ViewModel 并把它交给界面 ChatScreen。
+ * App 入口：创建 ViewModel 并交给界面 ChatScreen。
  */
 class MainActivity : ComponentActivity() {
 
-    // by viewModels() 自动帮你创建并管理 ViewModel 生命周期
+    // by viewModels() 自动创建并管理 ViewModel 生命周期
     private val viewModel: ChatViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // App 启动时：初始化本地 token 缓存（没有则自动生成），并做登录校验
+        TokenStore.init(applicationContext)
+        viewModel.loadToken()
+        viewModel.login()
+
+        // App 启动时：请求后端获取可用模型列表
+        viewModel.loadModels()
+
         setContent {
-            // 用 Material3 默认主题（你以后可换成深色/自定义配色）
+            // Material3 默认主题
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     ChatScreen(viewModel)

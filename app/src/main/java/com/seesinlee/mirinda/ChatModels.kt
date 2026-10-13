@@ -3,7 +3,7 @@ package com.seesinlee.mirinda
 import android.net.Uri
 
 /**
- * 数据模型层（相当于你熟悉的 POJO / DTO）
+ * 数据模型层。
  *
  * 一条消息的内容用「块(Block)数组」表示：
  * 可同时包含 推理块 + 文字块 + 多个图片块。
@@ -56,14 +56,20 @@ data class ChatMessage(
 data class ChatModel(
     val id: String,
     val name: String,
-    val desc: String = ""
+    val desc: String = "",
+    /** 该模型的欢迎语（后端 /agent 返回的 hello 字段） */
+    val hello: String = ""
 )
 
 /**
  * 一段对话（对话历史列表的条目）。
  */
 data class Conversation(
+    /** 前端本地唯一 id：用作 UI 列表 key 和内存消息表的键，始终非空 */
     val id: String,
+    /** 后端会话 id（数字的字符串形式）；"" 表示尚未入库的本地新对话，send 后由 meta 回填 */
+    val serverId: String = "",
     val title: String,
-    val updated: Long = System.currentTimeMillis()
+    /** 后端返回的创建时间字符串（直接展示）；本地新建对话为空 */
+    val createdAt: String = ""
 )

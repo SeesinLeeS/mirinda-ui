@@ -14,6 +14,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
+import kotlinx.coroutines.delay
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.lazy.LazyColumn
@@ -24,10 +25,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -94,19 +97,54 @@ fun ChatScreen(vm: ChatViewModel) {
         }
     } ?: 0
 
-    // 用户是否已经在底部附近（若手动往上翻看历史，就不要把他强行拽回底部）
+    // 最后一条消息的 id：作为“底部是否新增消息”的信号。
+    // 下拉加载更早历史是往【顶部】prepend，最后一条 id 不变 -> 不会触发自动跟随，避免被拽到底部。
+    val lastMessageId = vm.messages.lastOrNull()?.id
+
+    // 用户是否已经在底部附近（若手动往上翻看历史，就不要把他强行拽回底部）。
+    // 布局未就绪（可见项为空）时返回 false，避免 prepend 重排瞬间误判为“在底部”。
     val isNearBottom by remember {
         derivedStateOf {
             val info = listState.layoutInfo
-            val last = info.visibleItemsInfo.lastOrNull() ?: return@derivedStateOf true
+            val last = info.visibleItemsInfo.lastOrNull() ?: return@derivedStateOf false
             last.index >= info.totalItemsCount - 2
         }
     }
 
-    LaunchedEffect(vm.messages.size, lastContentSignature) {
+    // 自动跟随到底部：仅当【底部】发生变化（追加新消息 / 流式增长）时触发；
+    // key 用 lastMessageId + lastContentSignature，不再用 messages.size，避免顶部 prepend 误触发。
+    LaunchedEffect(lastMessageId, lastContentSignature) {
         val total = listState.layoutInfo.totalItemsCount
         if (total > 0 && isNearBottom) {
-            listState.scrollToItem(total - 1)
+            // 大 offset 确保最后一项贴到视口底部（而非顶部对齐）
+            listState.scrollToItem(total - 1, 1_000_000)
+        }
+    }
+
+    // 进入/切换会话、历史首页就绪、点击发送：无条件定位到最新一条底部。
+    // 气泡含“深度思考”面板，其高度可能在渲染后才稳定，故延时重试几次确保真正贴底。
+    LaunchedEffect(vm.scrollToBottomSignal.value) {
+        if (vm.messages.isNotEmpty()) {
+            repeat(4) {
+                val last = (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0)
+                // 大 offset 把最后一项推到视口底部（而非顶部对齐），LazyColumn 会自动 clamp
+                listState.scrollToItem(last, 1_000_000)
+                delay(40)
+            }
+        }
+    }
+
+    // 下拉到顶部附近：按页加载更早的历史消息（更早的拼到列表顶部，靠 key 锚定不跳动）。
+    // index 0 即首条消息，滑到顶时锚定在消息上，prepend 后 index 变大、isNearTop 变 false，
+    // 不会形成“加载->锚点不动->再次加载”的抖动循环。
+    val isNearTop by remember {
+        derivedStateOf {
+            listState.layoutInfo.totalItemsCount > 0 && listState.firstVisibleItemIndex <= 0
+        }
+    }
+    LaunchedEffect(isNearTop, vm.hasMoreHistory.value, vm.isLoadingMore.value) {
+        if (isNearTop && vm.hasMoreHistory.value && !vm.isLoadingMore.value) {
+            vm.loadOlderMessages()
         }
     }
 
@@ -154,6 +192,22 @@ fun ChatScreen(vm: ChatViewModel) {
             },
             containerColor = ChatColors.PageBg   // 整个页面深蓝背景
         ) { padding ->
+            // 模型加载失败：顶部红色横幅直接报错（不做静默兜底）
+            vm.errorMessage.value?.let { err ->
+                Surface(
+                    color = Color(0xFF5A1A1A),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(padding)
+                ) {
+                    Text(
+                        text = err,
+                        color = Color(0xFFFFD6D6),
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+                    )
+                }
+            }
             // 只有在"助手占位消息还一个字都没吐出来"时，才单独显示底部"思考中"动效；
             // 一旦开始流式输出（推理或正文），就由气泡内的"深度思考"面板接管提示。
             val lastMsg = vm.messages.lastOrNull()
@@ -172,22 +226,50 @@ fun ChatScreen(vm: ChatViewModel) {
                     .fillMaxSize()
                     .padding(padding)
             ) {
-                LazyColumn(
-                    state = listState,
+                // 用 Box 包住列表：加载更早的菊花作为【覆盖层】显示在顶部，
+                // 不占用列表项 -> 不改变项数与布局 -> prepend 时不抖动。
+                Box(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
-                        .padding(horizontal = 14.dp),
-                    verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    item { Spacer(Modifier.height(8.dp)) }
-                    items(vm.messages, key = { it.id }) { msg ->
-                        MessageBubble(msg)
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .padding(horizontal = 14.dp),
+                        // 顶/底间距用 contentPadding，避免在列表顶部放占位 item
+                        // （占位 item 会霸占 index 0，破坏 prepend 的 key 锚定、导致抖动）
+                        contentPadding = PaddingValues(top = 8.dp, bottom = 4.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp)
+                    ) {
+                        // index 0 直接是第一条真实消息：滑到顶时锚定在消息上，
+                        // prepend 后该消息被下推、firstVisibleItemIndex 变大，
+                        // isNearTop 自然变 false，不会反复触发加载。
+                        items(vm.messages, key = { it.id }) { msg ->
+                            MessageBubble(msg)
+                        }
+                        if (waitingFirstChunk) {
+                            item { TypingIndicator() }
+                        }
                     }
-                    if (waitingFirstChunk) {
-                        item { TypingIndicator() }
+
+                    // 顶部加载指示（覆盖层）
+                    if (vm.isLoadingMore.value) {
+                        Box(
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .fillMaxWidth()
+                                .padding(top = 8.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(22.dp),
+                                strokeWidth = 2.dp,
+                                color = ChatColors.TextSecondary
+                            )
+                        }
                     }
-                    item { Spacer(Modifier.height(4.dp)) }
                 }
 
                 InputBar(
@@ -195,7 +277,8 @@ fun ChatScreen(vm: ChatViewModel) {
                     isLoading = vm.isLoading.value,
                     onPickImage = { vm.addPendingImage(it) },
                     onRemoveImage = { vm.removePendingImage(it) },
-                    onSend = { vm.sendMessage(it) }
+                    onSend = { vm.sendMessage(it) },
+                    onStop = { vm.stopGeneration() }
                 )
             }
         }
@@ -214,6 +297,12 @@ fun AppDrawer(
         drawerContainerColor = ChatColors.TopBar,
         modifier = Modifier.fillMaxWidth(0.82f)
     ) {
+        var showSettings by remember { mutableStateOf(false) }
+
+        if (showSettings) {
+            SettingsDialog(vm = vm, onDismiss = { showSettings = false })
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
@@ -358,13 +447,15 @@ fun AppDrawer(
                                     color = if (current) ChatColors.TextPrimary else ChatColors.TextSecondary,
                                     maxLines = 1
                                 )
-                                Spacer(Modifier.height(2.dp))
-                                Text(
-                                    formatTime(conv.updated),
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = ChatColors.TextSecondary.copy(alpha = 0.7f),
-                                    maxLines = 1
-                                )
+                                if (conv.createdAt.isNotBlank()) {
+                                    Spacer(Modifier.height(2.dp))
+                                    Text(
+                                        conv.createdAt,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = ChatColors.TextSecondary.copy(alpha = 0.7f),
+                                        maxLines = 1
+                                    )
+                                }
                             }
                             // 删除按钮
                             IconButton(
@@ -382,9 +473,121 @@ fun AppDrawer(
                     }
                 }
             }
-            Spacer(Modifier.height(12.dp))
+
+            // ============ 底部：左下角设置（齿轮）============
+            HorizontalDivider(color = ChatColors.InputBorder)
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Settings,
+                    contentDescription = "设置",
+                    tint = ChatColors.TextPrimary,
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .clickable { showSettings = true }
+                        .padding(4.dp)
+                        .size(22.dp)
+                )
+                Spacer(Modifier.weight(1f))
+                // 登录状态小圆点 + 文字
+                val (dotColor, label) = when (vm.loginState.value) {
+                    ChatViewModel.LoginState.SUCCESS -> Color(0xFF4CAF50) to "已登录"
+                    ChatViewModel.LoginState.LOADING -> ChatColors.TextSecondary to "登录中…"
+                    ChatViewModel.LoginState.FAILED  -> Color(0xFFE57373) to "未登录"
+                    ChatViewModel.LoginState.IDLE    -> ChatColors.TextSecondary to "—"
+                }
+                Surface(shape = CircleShape, color = dotColor, modifier = Modifier.size(8.dp)) {}
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    label,
+                    style = MaterialTheme.typography.labelMedium,
+                    color = ChatColors.TextSecondary
+                )
+            }
+            Spacer(Modifier.height(8.dp))
         }
     }
+}
+
+/**
+ * 设置页面（弹窗）：查看/编辑登录 token，查看登录状态，重新生成默认 token。
+ */
+@Composable
+fun SettingsDialog(vm: ChatViewModel, onDismiss: () -> Unit) {
+    // 本地编辑态，初始填入当前 token
+    var input by remember { mutableStateOf(TextFieldValue(vm.token.value)) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = ChatColors.TopBar,
+        title = {
+            Text("设置", color = ChatColors.TextPrimary)
+        },
+        text = {
+            Column {
+                Text(
+                    "登录 Token",
+                    style = MaterialTheme.typography.labelLarge,
+                    color = ChatColors.TextSecondary
+                )
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = input,
+                    onValueChange = { input = it },
+                    singleLine = false,
+                    maxLines = 3,
+                    placeholder = { Text("留空保存将自动生成一个默认 token") },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = ChatColors.TextPrimary,
+                        unfocusedTextColor = ChatColors.TextPrimary,
+                        focusedBorderColor = ChatColors.InputBorderFocused,
+                        unfocusedBorderColor = ChatColors.InputBorder,
+                        cursorColor = ChatColors.InputBorderFocused
+                    )
+                )
+                Spacer(Modifier.height(10.dp))
+
+                // 登录状态
+                val statusText = when (vm.loginState.value) {
+                    ChatViewModel.LoginState.SUCCESS -> "✅ 已登录"
+                    ChatViewModel.LoginState.LOADING -> "⏳ 登录中…"
+                    ChatViewModel.LoginState.FAILED  -> "❌ ${vm.loginMessage.value.ifBlank { "未登录" }}"
+                    ChatViewModel.LoginState.IDLE    -> "尚未登录"
+                }
+                Text(
+                    statusText,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = ChatColors.TextSecondary
+                )
+
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "留空保存将使用设备默认 Token。",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ChatColors.TextSecondary.copy(alpha = 0.7f)
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                vm.saveToken(input.text)
+                onDismiss()
+            }) {
+                Text("保存并登录", color = ChatColors.Accent)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("取消", color = ChatColors.TextSecondary)
+            }
+        }
+    )
 }
 
 /** 单条消息气泡 */
@@ -512,8 +715,10 @@ fun TypingIndicator() {
  */
 @Composable
 fun ReasoningPanel(text: String, thinking: Boolean) {
-    // 展开状态：思考中默认展开；思考结束自动收起（仍可手动点开）
-    var expanded by remember { mutableStateOf(true) }
+    // 展开状态：思考中默认展开；思考结束/历史消息默认折叠（仍可手动点开）。
+    // 初值直接取 thinking，避免“首帧展开(高) -> 随后折叠(矮)”的高度抖动，
+    // 否则进入历史会话时会按展开态算好滚动位置、随即折叠，导致停在“已深度思考”框处。
+    var expanded by remember { mutableStateOf(thinking) }
     LaunchedEffect(thinking) {
         expanded = thinking
     }
@@ -590,7 +795,8 @@ fun InputBar(
     isLoading: Boolean,
     onPickImage: (Uri) -> Unit,
     onRemoveImage: (Uri) -> Unit,
-    onSend: (String) -> Unit
+    onSend: (String) -> Unit,
+    onStop: () -> Unit
 ) {
     var text by remember { mutableStateOf(TextFieldValue("")) }
     var isFocused by remember { mutableStateOf(false) }   // 是否聚焦 -> 控制 hover 效果
@@ -750,33 +956,44 @@ fun InputBar(
 
                         Spacer(Modifier.weight(1f))
 
-                        // 右下角：发送按钮
-                        Surface(
-                            shape = CircleShape,
-                            color = if (canSend) ChatColors.Accent
-                            else Color.White.copy(alpha = 0.08f),
-                            modifier = Modifier
-                                .size(38.dp)
-                                .clickable(enabled = canSend) { doSend() }
-                        ) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.Send,
-                                contentDescription = "发送",
-                                tint = if (canSend) Color.White
-                                else ChatColors.TextSecondary.copy(alpha = 0.5f),
-                                modifier = Modifier.padding(8.dp)
-                            )
+                        // 右下角：生成中 -> "终止"按钮；否则 -> "发送"按钮
+                        if (isLoading) {
+                            // 终止按钮：始终可点，点击中断生成和网络请求
+                            Surface(
+                                shape = CircleShape,
+                                color = ChatColors.Accent,
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .clickable { onStop() }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Stop,
+                                    contentDescription = "终止生成",
+                                    tint = Color.White,
+                                    modifier = Modifier.padding(8.dp)
+                                )
+                            }
+                        } else {
+                            Surface(
+                                shape = CircleShape,
+                                color = if (canSend) ChatColors.Accent
+                                else Color.White.copy(alpha = 0.08f),
+                                modifier = Modifier
+                                    .size(38.dp)
+                                    .clickable(enabled = canSend) { doSend() }
+                            ) {
+                                Icon(
+                                    imageVector = Icons.AutoMirrored.Filled.Send,
+                                    contentDescription = "发送",
+                                    tint = if (canSend) Color.White
+                                    else ChatColors.TextSecondary.copy(alpha = 0.5f),
+                                    modifier = Modifier.padding(8.dp)
+                                )
+                            }
                         }
                     }
                 }
             }
         }
     }
-}
-
-
-/** 把时间戳格式化为 "MM-dd HH:mm" 显示在历史条目下方 */
-private fun formatTime(ts: Long): String {
-    val sdf = java.text.SimpleDateFormat("MM-dd HH:mm", java.util.Locale.getDefault())
-    return sdf.format(java.util.Date(ts))
 }

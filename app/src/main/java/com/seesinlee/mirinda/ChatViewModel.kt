@@ -7,11 +7,14 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.onCompletion
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.UUID
 
 /**
- * 业务逻辑层（相当于你后端的 Service 层）
+ * 业务逻辑层（Service）
  *
  * 它持有：
  *  - messages：当前对话的消息列表（UI 观察它，变了就自动刷新）
@@ -31,8 +34,11 @@ class ChatViewModel : ViewModel() {
     // 待发送的图片（输入框上方预览区的数据源）
     val pendingImages = mutableStateListOf<Uri>()
 
-    // 是否正在等待回复（控制发送按钮禁用/loading）
+    // 是否正在等待回复（控制发送按钮：loading 时变为"终止"按钮）
     val isLoading = mutableStateOf(false)
+
+    // 当前这次流式请求的协程任务，用于"中断生成"时取消它
+    private var sendJob: Job? = null
 
     // ============ 模型相关 ============
 
@@ -45,6 +51,26 @@ class ChatViewModel : ViewModel() {
     /** 欢迎语 */
     val welcomeText = mutableStateOf("")
 
+    /** 模型加载错误信息（非空时 UI 顶部横幅提示；加载成功时置空） */
+    val errorMessage = mutableStateOf<String?>(null)
+
+    // ============ 登录 / Token 相关 ============
+
+    /** 登录状态 */
+    enum class LoginState { IDLE, LOADING, SUCCESS, FAILED }
+
+    /** 当前登录状态 */
+    val loginState = mutableStateOf(LoginState.IDLE)
+
+    /** 登录失败时的提示信息 */
+    val loginMessage = mutableStateOf("")
+
+    /** 当前 token（设置页展示/编辑；来源于本地缓存 TokenStore） */
+    val token = mutableStateOf("")
+
+    /** 心跳轮询协程（登录成功后启动，每 1s 请求一次 /user/heartbeat） */
+    private var heartbeatJob: Job? = null
+
     // ============ 对话历史相关 ============
 
     /** 对话历史列表（抽屉下半部分展示） */
@@ -56,8 +82,40 @@ class ChatViewModel : ViewModel() {
     /** 各对话对应的消息（内存保存） */
     private val conversationMessages = mutableMapOf<String, MutableList<ChatMessage>>()
 
+    /** 已从后端加载过历史消息（已拉过首页）的本地对话 id 集合 */
+    private val loadedServerConversations = mutableSetOf<String>()
+
+    /** 每个本地对话已加载到的历史页码（page=1 为最新一页，越大越早） */
+    private val historyPage = mutableMapOf<String, Int>()
+
+    /** 每个本地对话是否还有更早的历史消息可加载 */
+    private val historyHasMore = mutableMapOf<String, Boolean>()
+
+    /** 当前对话是否还有更早历史可加载（UI 据此决定是否在顶部触发加载/显示菊花） */
+    val hasMoreHistory = mutableStateOf(false)
+
+    /** 是否正在加载更早的历史消息（UI 顶部显示加载指示） */
+    val isLoadingMore = mutableStateOf(false)
+
+    /**
+     * “滚动到最新一条底部”的一次性信号：每自增一次，UI 就把列表定位到最后。
+     * 用于：进入/切换会话、历史首页加载完成等“应当定位到最新消息底部”的时机。
+     */
+    val scrollToBottomSignal = mutableStateOf(0)
+    private fun requestScrollToBottom() { scrollToBottomSignal.value++ }
+
+    /** 加载更早历史的协程，切换会话时取消 */
+    private var loadMoreJob: Job? = null
+
+    /**
+     * 历史消息分页大小：后端每轮问答固定存 3 行（question/reasoning/token），
+     * 取 3 的倍数可让分页边界正好落在整轮之间，避免把一轮问答跨页截断。
+     */
+    private val HISTORY_PAGE_SIZE = 9
+
     init {
-        loadModels()
+        // 注意：获取模型列表的网络请求不在这里触发，
+        // 而是由 App 启动入口 MainActivity 显式调用 loadModels()。
         loadConversations()
     }
 
@@ -66,22 +124,148 @@ class ChatViewModel : ViewModel() {
     // ===================================================================
 
     /**
-     * 加载可选模型。
+     * 加载可选模型：通过 GET /agent 从后端动态获取。
      *
-     * 这里的 id 必须与后端 config.yaml 里的 model 名一致，
-     * 因为请求体里的 "model" 字段用的就是它。后端目前支持 "deepseek-flash"。
+     * 后端返回的每个模型含 name / desc / hello，
+     * 其中 name 既作为列表展示名，也作为发送请求时的 "model" 字段值。
+     * 网络请求是异步的：先放一个占位默认值保证界面不空，
+     * 拉到真实列表后再覆盖，并用选中模型的 hello 作为欢迎语。
+     *
+     * 由 App 启动入口（MainActivity.onCreate）显式调用。
      */
-    private fun loadModels() {
-        val models = listOf(
-            ChatModel(id = "deepseek-flash", name = "DeepSeek Flash", desc = "深度求索 · 流式")
-            // 以后后端支持更多模型时，在这里继续加（id 要与后端 config 对应）
-        )
-        availableModels.clear()
-        availableModels.addAll(models)
-        // 默认选中第一个
-        selectedModel.value = availableModels.firstOrNull()
+    fun loadModels() {
+        viewModelScope.launch {
+            try {
+                val models = ChatApi.fetchModels()
+                if (models.isEmpty()) {
+                    throw RuntimeException("后端返回的模型列表为空")
+                }
+                availableModels.clear()
+                availableModels.addAll(models)
+                selectedModel.value = models.first()
+                welcomeText.value = models.first().hello
+                errorMessage.value = null
+                refreshWelcomeMessage()
+            } catch (e: Exception) {
+                // 不做兜底：直接把错误暴露给用户
+                errorMessage.value = "加载模型失败：${e.message}"
+            }
+        }
+    }
 
-        welcomeText.value = "你好～ 输入文字后发送试试。\n左上角菜单可切换模型和历史对话。"
+    /**
+     * 用最新的 welcomeText 刷新"尚未开始聊天"的对话里的欢迎语。
+     * 只替换那些仅含一条 assistant 欢迎消息的对话，避免动到已有的聊天记录。
+     */
+    private fun refreshWelcomeMessage() {
+        val w = welcomeText.value
+        if (w.isBlank()) return
+
+        // "尚未开始聊天"的对话：空列表（启动时 welcomeText 还没就绪而留空），
+        // 或仅含一条 assistant 欢迎消息。两种都要刷新/补插欢迎语。
+        fun isFreshWelcome(list: List<ChatMessage>): Boolean =
+            list.isEmpty() || (list.size == 1 && list[0].role == Role.ASSISTANT)
+
+        fun applyTo(list: MutableList<ChatMessage>) {
+            if (list.isEmpty()) {
+                list.add(
+                    ChatMessage(
+                        id = newId(),
+                        role = Role.ASSISTANT,
+                        blocks = listOf(ContentBlock.Text(w))
+                    )
+                )
+            } else {
+                list[0] = list[0].copy(blocks = listOf(ContentBlock.Text(w)))
+            }
+        }
+
+        // 内存里各对话
+        conversationMessages.forEach { (_, list) ->
+            if (isFreshWelcome(list)) applyTo(list)
+        }
+        // 当前正在显示的 messages
+        if (isFreshWelcome(messages)) applyTo(messages)
+    }
+
+    // ===================================================================
+    //  登录 / Token
+    // ===================================================================
+
+    /**
+     * 从本地缓存加载 token（若从未设置，TokenStore 会自动生成一个默认 token）。
+     * 由 App 启动入口调用。
+     */
+    fun loadToken() {
+        token.value = TokenStore.getToken()
+    }
+
+    /**
+     * 向后端 GET /user 做登录校验（带 x-user-token 头）。
+     * HTTP 200 即登录成功。由 App 启动入口在 loadToken 之后调用。
+     */
+    fun login() {
+        loginState.value = LoginState.LOADING
+        loginMessage.value = ""
+        viewModelScope.launch {
+            try {
+                val r = ChatApi.login()
+                if (r.ok) {
+                    loginState.value = LoginState.SUCCESS
+                    loginMessage.value = ""
+                    // 登录成功后启动心跳轮询，由心跳维持在线状态
+                    startHeartbeat()
+                } else {
+                    loginState.value = LoginState.FAILED
+                    loginMessage.value = "登录失败（HTTP ${r.httpCode}，code=${r.bizCode}）${r.message}"
+                    stopHeartbeat()
+                }
+            } catch (e: Exception) {
+                loginState.value = LoginState.FAILED
+                loginMessage.value = "登录失败：${e.message}"
+                stopHeartbeat()
+            }
+        }
+    }
+
+    /**
+     * 保存用户在设置页填写的 token，并重新登录。
+     * 传空串则由 TokenStore 重新生成一个默认 token。
+     */
+    fun saveToken(newToken: String) {
+        token.value = TokenStore.setToken(newToken)
+        login()
+    }
+
+    /**
+     * 启动心跳轮询：每 1s 请求一次 /user/heartbeat，根据结果刷新登录状态小圆点。
+     * 通 → SUCCESS，不通 → FAILED；轮询不会因失败而停止，便于网络恢复后自动变回在线。
+     */
+    private fun startHeartbeat() {
+        stopHeartbeat()
+        heartbeatJob = viewModelScope.launch {
+            while (isActive) {
+                val ok = ChatApi.heartbeat()
+                loginState.value = if (ok) LoginState.SUCCESS else LoginState.FAILED
+                if (!ok && loginMessage.value.isBlank()) {
+                    loginMessage.value = "心跳失败，连接已断开"
+                } else if (ok) {
+                    loginMessage.value = ""
+                }
+                delay(1000)
+            }
+        }
+    }
+
+    /** 停止心跳轮询。 */
+    private fun stopHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        stopHeartbeat()
     }
 
     /** 生成一段"新对话"的初始消息：带上欢迎语 */
@@ -100,9 +284,10 @@ class ChatViewModel : ViewModel() {
         return list
     }
 
-    /** 选择模型 */
+    /** 选择模型（同步更新欢迎语为该模型的 hello） */
     fun selectModel(model: ChatModel) {
         selectedModel.value = model
+        model.hello.takeIf { it.isNotBlank() }?.let { welcomeText.value = it }
     }
 
     // ===================================================================
@@ -110,55 +295,256 @@ class ChatViewModel : ViewModel() {
     // ===================================================================
 
     private fun loadConversations() {
-        val first = Conversation(id = newId(), title = "新对话")
+        // 本地先放一个"新对话"草稿作为当前会话（serverId 为空，发第一条消息后由 meta 回填）
+        val first = Conversation(id = newId(), serverId = "", title = "新对话")
         conversations.clear()
         conversations.add(first)
         currentConversationId.value = first.id
 
         conversationMessages[first.id] = freshConversationMessages()
         syncMessagesFromCurrent()
+
+        // 异步从后端拉取历史对话列表，合并到列表中
+        refreshConversationsFromServer()
+    }
+
+    /**
+     * 从后端拉取历史对话列表并合并进 conversations：
+     *  - 已存在（serverId 相同）的本地条目：更新其 title / createdAt
+     *  - 不存在的：作为新条目追加（分配一个本地 id）
+     * 本地未入库草稿（serverId 为空）始终保留，不受影响。
+     */
+    fun refreshConversationsFromServer() {
+        viewModelScope.launch {
+            try {
+                val remote = ChatApi.fetchConversations(page = 1, pageSize = 50)
+                remote.forEach { b ->
+                    val idx = conversations.indexOfFirst { it.serverId == b.serverId && b.serverId.isNotBlank() }
+                    if (idx >= 0) {
+                        conversations[idx] = conversations[idx].copy(title = b.title, createdAt = b.createdAt)
+                    } else {
+                        conversations.add(
+                            Conversation(
+                                id = newId(),
+                                serverId = b.serverId,
+                                title = b.title,
+                                createdAt = b.createdAt
+                            )
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                errorMessage.value = "加载历史对话失败：${e.message}"
+            }
+        }
     }
 
     /** 切换到某段历史对话 */
     fun switchConversation(id: String) {
         if (id == currentConversationId.value) return
+        loadMoreJob?.cancel()            // 取消上一个会话未完成的“加载更早”
+        isLoadingMore.value = false
         saveMessagesToCurrent()          // 先存好当前对话
         currentConversationId.value = id
-        syncMessagesFromCurrent()        // 再加载目标对话
+        syncMessagesFromCurrent()        // 再加载目标对话（内存里的）
         pendingImages.clear()
+        // 恢复该会话的“是否还有更早”标记（已加载过的会话直接用缓存）
+        hasMoreHistory.value = historyHasMore[id] ?: false
+        requestScrollToBottom()          // 进入会话：先按内存内容定位到底部
+        maybeLoadServerMessages(id)      // 已入库对话：首次进入时从后端拉取最新一页
+    }
+
+    /**
+     * 首次进入某段已入库对话时，从后端拉取**最新一页**消息（page=1）。
+     *  - 本地草稿（serverId 为空）：无需拉取；
+     *  - 已加载过 / 内存里已有真实聊天记录：跳过，避免覆盖正在进行的会话。
+     * 更早的历史由 loadOlderMessages()（上滑触发）按页加载。
+     */
+    private fun maybeLoadServerMessages(localId: String) {
+        val conv = conversations.firstOrNull { it.id == localId } ?: return
+        if (conv.serverId.isBlank()) { hasMoreHistory.value = false; return }
+        if (loadedServerConversations.contains(localId)) return
+        // 内存里已有实质聊天记录（不只是欢迎语）就不覆盖
+        val cached = conversationMessages[localId]
+        if (cached != null && cached.size > 1) {
+            loadedServerConversations.add(localId)
+            hasMoreHistory.value = false
+            return
+        }
+
+        loadedServerConversations.add(localId)   // 先占位，防止重复并发请求
+        historyPage[localId] = 1
+        viewModelScope.launch {
+            try {
+                val briefs = ChatApi.fetchMessages(conv.serverId, page = 1, pageSize = HISTORY_PAGE_SIZE)
+                val more = briefs.size >= HISTORY_PAGE_SIZE
+                historyHasMore[localId] = more
+                val msgs = briefsToMessages(briefs)
+                if (msgs.isNotEmpty()) {
+                    conversationMessages[localId] = msgs.toMutableList()
+                }
+                if (currentConversationId.value == localId) {
+                    if (msgs.isNotEmpty()) {
+                        messages.clear()
+                        messages.addAll(msgs)
+                        requestScrollToBottom()   // 首页历史就绪：定位到最新一条底部
+                    }
+                    hasMoreHistory.value = more
+                }
+            } catch (e: Exception) {
+                loadedServerConversations.remove(localId)   // 失败允许下次重试
+                errorMessage.value = "加载对话消息失败：${e.message}"
+            }
+        }
+    }
+
+    /**
+     * 上滑加载更早的历史消息（当前对话的下一页），把结果**拼接到列表顶部**。
+     * 消息 id 由后端 id 派生（srv- 前缀），prepend 后 LazyColumn 会靠 key 锚定，
+     * 滚动位置不跳。无更早 / 正在加载 / 非入库对话时直接返回。
+     */
+    fun loadOlderMessages() {
+        val localId = currentConversationId.value ?: return
+        val conv = conversations.firstOrNull { it.id == localId } ?: return
+        if (conv.serverId.isBlank()) return
+        if (historyHasMore[localId] != true) return
+        if (isLoadingMore.value) return
+
+        val nextPage = (historyPage[localId] ?: 1) + 1
+        isLoadingMore.value = true
+        loadMoreJob = viewModelScope.launch {
+            try {
+                val older = ChatApi.fetchMessages(conv.serverId, page = nextPage, pageSize = HISTORY_PAGE_SIZE)
+                val more = older.size >= HISTORY_PAGE_SIZE
+                historyHasMore[localId] = more
+                if (older.isNotEmpty()) {
+                    historyPage[localId] = nextPage
+                    val olderMsgs = briefsToMessages(older)
+                    // 拼到内存与 UI 列表最前面（更早的在上）
+                    val mem = conversationMessages.getOrPut(localId) { mutableListOf() }
+                    mem.addAll(0, olderMsgs)
+                    if (currentConversationId.value == localId) {
+                        messages.addAll(0, olderMsgs)
+                    }
+                }
+                if (currentConversationId.value == localId) hasMoreHistory.value = more
+            } catch (e: Exception) {
+                errorMessage.value = "加载更早消息失败：${e.message}"
+            } finally {
+                isLoadingMore.value = false
+            }
+        }
+    }
+
+    /**
+     * 把后端返回的扁平消息列表（已按时间正序）转换成 UI 的 ChatMessage 列表。
+     *
+     * 后端每一轮问答存 3 条：user(question) + assistant(reasoning) + assistant(token)，
+     * 这里把相邻的 assistant 推理/正文合并成**一条**助手气泡：
+     *   - reasoning 非空 -> Reasoning 块（可折叠"深度思考"）
+     *   - token 非空     -> Text 块（正式回复）
+     * 消息 id 由后端消息 id 派生（srv- 前缀），保证分页 prepend 时 key 稳定、滚动不跳。
+     */
+    private fun briefsToMessages(briefs: List<ChatApi.MessageBrief>): List<ChatMessage> {
+        val result = mutableListOf<ChatMessage>()
+        var reasoning = StringBuilder()
+        var content = StringBuilder()
+        var hasAssistant = false
+        var groupId: String? = null
+
+        fun flushAssistant() {
+            if (!hasAssistant) return
+            val blocks = buildList {
+                if (reasoning.isNotEmpty()) add(ContentBlock.Reasoning(reasoning.toString()))
+                if (content.isNotEmpty()) add(ContentBlock.Text(content.toString()))
+            }.ifEmpty { listOf(ContentBlock.Text("")) }
+            result.add(ChatMessage(id = "srv-a-${groupId ?: newId()}", role = Role.ASSISTANT, blocks = blocks))
+            reasoning = StringBuilder()
+            content = StringBuilder()
+            hasAssistant = false
+            groupId = null
+        }
+
+        for (b in briefs) {
+            if (b.role == "assistant") {
+                when (b.messageType) {
+                    "reasoning" -> {
+                        // 新一轮回复以 reasoning 开头：若上一条助手已有正文，先结算
+                        if (content.isNotEmpty()) flushAssistant()
+                        if (groupId == null) groupId = b.id
+                        if (b.part.isNotEmpty()) reasoning.append(b.part)
+                        hasAssistant = true
+                    }
+                    else -> {   // token / image / 其它都并入正文
+                        if (groupId == null) groupId = b.id
+                        content.append(b.part)
+                        hasAssistant = true
+                    }
+                }
+            } else {
+                // 用户消息：先结算上一条助手气泡，再加用户气泡
+                flushAssistant()
+                val blocks = when (b.messageType) {
+                    "image" -> listOf(ContentBlock.Image(remoteUrl = b.part))
+                    else -> listOf(ContentBlock.Text(b.part))
+                }
+                result.add(ChatMessage(id = "srv-u-${b.id}", role = Role.USER, blocks = blocks))
+            }
+        }
+        flushAssistant()
+        return result
     }
 
     /** 新建对话 */
     fun newConversation() {
         saveMessagesToCurrent()
-        val conv = Conversation(id = newId(), title = "新对话")
+        val conv = Conversation(id = newId(), serverId = "", title = "新对话")
         conversations.add(0, conv)       // 放到列表最上面
         currentConversationId.value = conv.id
         conversationMessages[conv.id] = freshConversationMessages()
         pendingImages.clear()
+        hasMoreHistory.value = false     // 新对话没有更早历史
         syncMessagesFromCurrent()
+        requestScrollToBottom()
     }
 
-    /** 删除某段历史对话 */
+    /** 删除某段历史对话（已入库的同时请求后端删除） */
     fun deleteConversation(id: String) {
         val idx = conversations.indexOfFirst { it.id == id }
         if (idx < 0) return
+        val serverId = conversations[idx].serverId
         val wasCurrent = currentConversationId.value == id
         conversations.removeAt(idx)
         conversationMessages.remove(id)
+        loadedServerConversations.remove(id)
+        historyPage.remove(id)
+        historyHasMore.remove(id)
+
+        // 已入库的会话同步请求后端删除
+        if (serverId.isNotBlank()) {
+            viewModelScope.launch {
+                runCatching { ChatApi.deleteConversation(serverId) }
+                    .onFailure { errorMessage.value = "删除对话失败：${it.message}" }
+            }
+        }
 
         if (wasCurrent) {
             val next = conversations.firstOrNull()
             if (next != null) {
                 currentConversationId.value = next.id
+                hasMoreHistory.value = historyHasMore[next.id] ?: false
+                syncMessagesFromCurrent()
+                requestScrollToBottom()
+                maybeLoadServerMessages(next.id)
             } else {
-                val conv = Conversation(id = newId(), title = "新对话")
+                val conv = Conversation(id = newId(), serverId = "", title = "新对话")
                 conversations.add(conv)
                 currentConversationId.value = conv.id
                 conversationMessages[conv.id] = freshConversationMessages()
+                hasMoreHistory.value = false
+                syncMessagesFromCurrent()
             }
             pendingImages.clear()
-            syncMessagesFromCurrent()
         }
     }
 
@@ -201,8 +587,8 @@ class ChatViewModel : ViewModel() {
      * 2. 先插入一条"空的助手消息"占位（isStreaming=true）
      * 3. 调后端 /agent/send，按 SSE 增量把 token 追加到该助手消息里
      *
-     * 注意：后端请求体只有 {message, model}，暂不支持图片，
-     * 因此图片只在本地气泡里预览，不会上传。
+     * 注意：请求体为 {message, model, conversation_id}，暂不支持图片上传，
+     * 因此图片只在本地气泡里预览。
      */
     fun sendMessage(text: String) {
         if (text.isBlank() && pendingImages.isEmpty()) return
@@ -235,13 +621,21 @@ class ChatViewModel : ViewModel() {
             )
         )
         isLoading.value = true
+        requestScrollToBottom()          // 发送后定位到最新一条底部
 
         // ---- 发起流式请求 ----
         val reasoning = StringBuilder()
         val content = StringBuilder()
 
-        viewModelScope.launch {
-            ChatApi.sendStream(userText, modelId)
+        // 当前会话的后端 id：新对话为空 -> 传 0，后端新建并在 meta 事件回传真实 id
+        val currentServerId = conversations
+            .firstOrNull { it.id == currentConversationId.value }
+            ?.serverId
+            .orEmpty()
+        val conversationId = currentServerId.toIntOrNull() ?: 0
+
+        sendJob = viewModelScope.launch {
+            ChatApi.sendStream(userText, modelId, conversationId)
                 .catch { e ->
                     // 出错：把错误显示在助手气泡里
                     val msg = "请求失败：${e.message ?: e.toString()}"
@@ -258,6 +652,10 @@ class ChatViewModel : ViewModel() {
                 }
                 .collect { ev ->
                     when (ev) {
+                        is ChatApi.StreamEvent.Meta -> {
+                            // 新对话：后端此时才分配会话 id，回填到当前会话
+                            onMetaReceived(ev.conversationId, ev.title)
+                        }
                         is ChatApi.StreamEvent.Reasoning -> {
                             reasoning.append(ev.delta)
                             updateAssistant(assistantId, reasoning.toString(), content.toString(), streaming = true)
@@ -269,6 +667,24 @@ class ChatViewModel : ViewModel() {
                     }
                 }
         }
+    }
+
+    /**
+     * 中断生成：取消正在进行的流式请求（同时会断开底层网络连接），
+     * 并把当前助手气泡的"流式中"标记取消、存档。
+     */
+    fun stopGeneration() {
+        if (!isLoading.value) return
+        sendJob?.cancel()        // 取消协程 -> ChatApi 的 finally 里 disconnect 断网
+        sendJob = null
+        isLoading.value = false
+
+        // 收尾：把仍在流式的助手消息标记为结束
+        val idx = messages.indexOfLast { it.role == Role.ASSISTANT && it.isStreaming }
+        if (idx >= 0) {
+            messages[idx] = messages[idx].copy(isStreaming = false)
+        }
+        saveMessagesToCurrent()
     }
 
     /**
@@ -291,6 +707,22 @@ class ChatViewModel : ViewModel() {
         messages[idx] = messages[idx].copy(blocks = blocks, isStreaming = streaming)
     }
 
+    /**
+     * 收到流式 meta 事件：把后端会话 id（及标题）回填到当前会话。
+     * 仅当当前会话尚未入库（serverId 为空）时回填 id，避免覆盖已有会话。
+     */
+    private fun onMetaReceived(conversationId: String, title: String) {
+        if (conversationId.isBlank()) return
+        val id = currentConversationId.value ?: return
+        val idx = conversations.indexOfFirst { it.id == id }
+        if (idx < 0) return
+        val conv = conversations[idx]
+        if (conv.serverId.isBlank()) {
+            val newTitle = if (conv.title == "新对话" && title.isNotBlank()) title else conv.title
+            conversations[idx] = conv.copy(serverId = conversationId, title = newTitle)
+        }
+    }
+
     /** 用第一条用户文字作为对话标题 */
     private fun maybeUpdateTitle(text: String) {
         val id = currentConversationId.value ?: return
@@ -299,7 +731,7 @@ class ChatViewModel : ViewModel() {
         val conv = conversations[idx]
         if (conv.title == "新对话" && text.isNotBlank()) {
             val title = if (text.length > 16) text.take(16) + "…" else text
-            conversations[idx] = conv.copy(title = title, updated = System.currentTimeMillis())
+            conversations[idx] = conv.copy(title = title)
         }
     }
 
