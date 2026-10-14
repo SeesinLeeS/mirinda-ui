@@ -30,7 +30,7 @@ object ChatApi {
     /**
      * 后端地址。
      */
-    private const val BASE_URL = "http://10.83.254.37:9090"
+    private const val BASE_URL = "http://10.83.254.54:9090"
 
     /** 流式事件类型 */
     sealed class StreamEvent {
@@ -387,6 +387,81 @@ object ChatApi {
                             dataBuf.append(line.removePrefix("data:"))
                         }
                         // 以 ":" 开头的是注释行；其它未知字段忽略
+                    }
+                }
+            }
+        } finally {
+            conn.disconnect()
+        }
+    }.flowOn(Dispatchers.IO)
+
+    /**
+     * 悬浮窗「划词查询」专用：POST /agent/send_once，流式返回。
+     *
+     * 与 [sendStream] 的区别：该接口**只产出 SSE 的 token 事件**（正文增量），
+     * 不包含 reasoning / meta。因此这里直接把每个 token 的文本增量作为字符串发出，
+     * 调用方拼接即可得到完整正文。
+     *
+     * 一次性查询：不传 model（后端有默认模型），也不带 conversation_id
+     * （悬浮窗用完即弃，不落地到 App 内历史对话）。请求体仅含 message。
+     *
+     * @param message 用户划词选中的文字
+     */
+    fun sendOnceStream(message: String): Flow<String> = flow {
+        val url = URL("$BASE_URL/agent/send_once")
+        val conn = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Accept", "text/event-stream")
+            applyAuth()
+            connectTimeout = 15_000
+            readTimeout = 60_000   // 两个 token 之间的最大等待
+        }
+
+        val payload = JSONObject()
+            .put("message", message)
+            .toString()
+
+        try {
+            conn.outputStream.use { it.write(payload.toByteArray(Charsets.UTF_8)) }
+
+            val code = conn.responseCode
+            if (code != HttpURLConnection.HTTP_OK) {
+                val err = runCatching {
+                    conn.errorStream?.bufferedReader()?.use { it.readText() }
+                }.getOrNull().orEmpty()
+                throw RuntimeException("服务端返回 $code：$err")
+            }
+
+            // ---- 逐行读取并解析 SSE，只保留 token 事件 ----
+            var eventName: String? = null
+            val dataBuf = StringBuilder()
+
+            conn.inputStream.bufferedReader().use { reader ->
+                while (currentCoroutineContext().isActive) {
+                    val line = reader.readLine() ?: break
+
+                    if (line.isEmpty()) {
+                        // 空行 = 一个完整事件结束
+                        if (eventName == "token" && dataBuf.isNotEmpty()) {
+                            // emit 是挂起点：协程被取消会在此抛出 CancellationException -> finally 断连
+                            emit(dataBuf.toString())
+                        }
+                        eventName = null
+                        dataBuf.setLength(0)
+                        continue
+                    }
+
+                    when {
+                        line.startsWith("event:") -> {
+                            eventName = line.removePrefix("event:").trim()
+                        }
+                        line.startsWith("data:") -> {
+                            if (dataBuf.isNotEmpty()) dataBuf.append("\n")
+                            dataBuf.append(line.removePrefix("data:"))
+                        }
+                        // 注释行 / 未知字段忽略
                     }
                 }
             }

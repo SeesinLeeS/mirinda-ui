@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">mirinda</string>
+    <string name="quick_query_label">Mirinda</string>
 </resources>

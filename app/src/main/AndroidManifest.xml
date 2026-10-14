@@ -5,6 +5,14 @@
     <!-- 访问后端需要联网权限 -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- 系统级悬浮窗：在其他应用上层显示查询弹窗 -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!-- 前台服务：承载悬浮窗，避免被系统回收；特殊用途类型 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
@@ -27,6 +35,33 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- 划词查询薄启动器：注册到系统文本选择工具栏（PROCESS_TEXT）。
+             本身无界面（透明主题），仅负责校验悬浮窗权限并拉起前台服务。 -->
+        <activity
+            android:name="com.seesinlee.mirinda.QuickQueryActivity"
+            android:exported="true"
+            android:label="@string/quick_query_label"
+            android:theme="@style/Theme.Mirinda.Invisible"
+            android:excludeFromRecents="true"
+            android:taskAffinity=""
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+
+        <!-- 悬浮窗前台服务：用 WindowManager 在其他应用上层展示查询结果 -->
+        <service
+            android:name="com.seesinlee.mirinda.FloatingQueryService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="划词查询悬浮窗（用户主动触发、短时存在，用于在其他应用上层展示查询结果）" />
+        </service>
     </application>
 
 </manifest>

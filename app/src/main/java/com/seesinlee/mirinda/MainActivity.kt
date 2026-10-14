@@ -1,5 +1,6 @@
 package com.seesinlee.mirinda
 
+import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -36,5 +37,29 @@ class MainActivity : ComponentActivity() {
                 }
             }
         }
+
+        // 处理来自「划词查询」弹窗的跳转：新建对话并直接发起查询
+        handlePrefillIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handlePrefillIntent(intent)
+    }
+
+    /** 若 intent 携带划词文字，则开一个新对话并自动发送。 */
+    private fun handlePrefillIntent(intent: Intent?) {
+        val text = intent?.getStringExtra(EXTRA_PREFILL_TEXT)?.trim().orEmpty()
+        if (text.isBlank()) return
+        // 用后即清，避免配置变更 / 重入时重复发送
+        intent?.removeExtra(EXTRA_PREFILL_TEXT)
+        viewModel.newConversation()
+        viewModel.sendMessage(text)
+    }
+
+    companion object {
+        /** 携带「划词查询」选中文字的 Intent 额外字段 key。 */
+        const val EXTRA_PREFILL_TEXT = "com.seesinlee.mirinda.extra.PREFILL_TEXT"
     }
 }

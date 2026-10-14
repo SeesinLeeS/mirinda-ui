@@ -140,12 +140,21 @@ class ChatViewModel : ViewModel() {
                 if (models.isEmpty()) {
                     throw RuntimeException("后端返回的模型列表为空")
                 }
+                // 记住重复调用（如每次打开菜单刷新）前的选中项，避免被覆盖
+                val prevId = selectedModel.value?.id
                 availableModels.clear()
                 availableModels.addAll(models)
-                selectedModel.value = models.first()
-                welcomeText.value = models.first().hello
+                val keep = models.firstOrNull { it.id == prevId }
+                if (keep != null) {
+                    // 用户此前已选模型仍然可用：保持不变，不打断当前欢迎语/会话
+                    selectedModel.value = keep
+                } else {
+                    // 首次加载或原选中项已下线：回落到第一个并刷新欢迎语
+                    selectedModel.value = models.first()
+                    welcomeText.value = models.first().hello
+                    refreshWelcomeMessage()
+                }
                 errorMessage.value = null
-                refreshWelcomeMessage()
             } catch (e: Exception) {
                 // 不做兜底：直接把错误暴露给用户
                 errorMessage.value = "加载模型失败：${e.message}"
@@ -235,6 +244,8 @@ class ChatViewModel : ViewModel() {
     fun saveToken(newToken: String) {
         token.value = TokenStore.setToken(newToken)
         login()
+        // 保存并登录后，用新 token 刷新一次历史会话列表
+        refreshConversationsFromServer()
     }
 
     /**
@@ -309,29 +320,41 @@ class ChatViewModel : ViewModel() {
     }
 
     /**
-     * 从后端拉取历史对话列表并合并进 conversations：
-     *  - 已存在（serverId 相同）的本地条目：更新其 title / createdAt
-     *  - 不存在的：作为新条目追加（分配一个本地 id）
-     * 本地未入库草稿（serverId 为空）始终保留，不受影响。
+     * 从后端拉取历史对话列表并重建 conversations：
+     *  - 唯一的“新对话”草稿（serverId 为空）始终置顶，且**有且仅有一个**；
+     *  - 远程会话排在草稿之后，并复用已有本地条目（保留其本地 id 与已加载的消息缓存）；
+     *  - 已存在的更新 title / createdAt，不存在的分配一个新的本地 id。
      */
     fun refreshConversationsFromServer() {
         viewModelScope.launch {
             try {
                 val remote = ChatApi.fetchConversations(page = 1, pageSize = 50)
-                remote.forEach { b ->
-                    val idx = conversations.indexOfFirst { it.serverId == b.serverId && b.serverId.isNotBlank() }
-                    if (idx >= 0) {
-                        conversations[idx] = conversations[idx].copy(title = b.title, createdAt = b.createdAt)
-                    } else {
-                        conversations.add(
-                            Conversation(
-                                id = newId(),
-                                serverId = b.serverId,
-                                title = b.title,
-                                createdAt = b.createdAt
-                            )
-                        )
+
+                // 1) 取唯一草稿：优先当前会话正用的草稿，其次列表里第一个草稿，都没有则新建一个
+                val draft = conversations.firstOrNull { it.id == currentConversationId.value && it.serverId.isBlank() }
+                    ?: conversations.firstOrNull { it.serverId.isBlank() }
+                    ?: Conversation(id = newId(), serverId = "", title = "新对话").also {
+                        conversationMessages[it.id] = freshConversationMessages()
                     }
+
+                // 2) 重建列表：草稿置顶 + 远程会话（复用已有本地条目，保留 local id 与消息缓存）
+                val rebuilt = mutableListOf(draft)
+                remote.forEach { b ->
+                    if (b.serverId.isBlank()) return@forEach
+                    val existing = conversations.firstOrNull { it.serverId == b.serverId }
+                    rebuilt.add(
+                        existing?.copy(title = b.title, createdAt = b.createdAt)
+                            ?: Conversation(id = newId(), serverId = b.serverId, title = b.title, createdAt = b.createdAt)
+                    )
+                }
+
+                conversations.clear()
+                conversations.addAll(rebuilt)
+
+                // 当前会话若在重建后已不存在（例如多余草稿被合并清理），切回保留的草稿
+                if (conversations.none { it.id == currentConversationId.value }) {
+                    currentConversationId.value = draft.id
+                    syncMessagesFromCurrent()
                 }
             } catch (e: Exception) {
                 errorMessage.value = "加载历史对话失败：${e.message}"
@@ -498,8 +521,10 @@ class ChatViewModel : ViewModel() {
     /** 新建对话 */
     fun newConversation() {
         saveMessagesToCurrent()
+        // 始终只保留一个“新对话”草稿（serverId 为空）：先清掉所有旧草稿，再置顶放新的
+        conversations.removeAll { it.serverId.isBlank() }
         val conv = Conversation(id = newId(), serverId = "", title = "新对话")
-        conversations.add(0, conv)       // 放到列表最上面
+        conversations.add(0, conv)       // 新草稿永远在列表最上面
         currentConversationId.value = conv.id
         conversationMessages[conv.id] = freshConversationMessages()
         pendingImages.clear()

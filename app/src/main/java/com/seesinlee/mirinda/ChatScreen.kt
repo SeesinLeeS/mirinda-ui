@@ -49,26 +49,26 @@ import coil.compose.AsyncImage
 /* ============================================================
  *  配色（深蓝主题）—— 想换色改这里即可
  * ============================================================ */
+// 主界面配色：全部引用全局 AppColors（唯一色值来源在 AppColors.kt）
 object ChatColors {
-    val PageBg = Color(0xFF0D1B3E)          // 页面背景：深蓝
-    val TopBar = Color(0xFF12234D)          // 顶栏：稍亮的深蓝
-    val InputBg = Color(0xFF1E3A6B)         // 输入框：浅蓝
-    val InputBgFocused = Color(0xFF274A86)  // 输入框聚焦时：更亮的浅蓝
-    val InputBorder = Color(0xFF2E4D80)     // 输入框默认边框
-    val InputBorderFocused = Color(0xFF5B9DFF) // 输入框聚焦边框：亮蓝(hover 效果)
+    val PageBg = AppColors.PageBg
+    val TopBar = AppColors.TopBar
+    val InputBg = AppColors.InputBg
+    val InputBgFocused = AppColors.InputBgFocused
+    val InputBorder = AppColors.InputBorder
+    val InputBorderFocused = AppColors.InputBorderFocused
 
-    val UserBubble = Color(0xFF3B82F6)      // 用户气泡：亮蓝
-    val AssistantBubble = Color(0xFFE4E9F2) // 助手气泡：灰白底
-    val AssistantText = Color(0xFF1A2236)   // 助手气泡文字：深色
+    val UserBubble = AppColors.UserBubble
+    val AssistantBubble = AppColors.AssistantBubble
+    val AssistantText = AppColors.AssistantText
 
-    val TextPrimary = Color(0xFFEAF1FF)     // 主文字：近白
-    val TextSecondary = Color(0xFF9DB2D6)   // 次要文字：灰蓝
-    val Accent = Color(0xFF4A90E2)          // 强调/发送按钮
+    val TextPrimary = AppColors.TextPrimary
+    val TextSecondary = AppColors.TextSecondary
+    val Accent = AppColors.Accent
 
-    // 深度思考面板
-    val ReasoningBg = Color(0xFF16305C)     // 思考面板背景：比页面略亮的深蓝
-    val ReasoningBorder = Color(0xFF2E4D80) // 思考面板边框
-    val ReasoningText = Color(0xFFB9C9E6)   // 思考正文：柔和灰蓝
+    val ReasoningBg = AppColors.ReasoningBg
+    val ReasoningBorder = AppColors.ReasoningBorder
+    val ReasoningText = AppColors.ReasoningText
 }
 
 
@@ -161,7 +161,12 @@ fun ChatScreen(vm: ChatViewModel) {
             topBar = {
                 CenterAlignedTopAppBar(
                     navigationIcon = {
-                        IconButton(onClick = { scope.launch { drawerState.open() } }) {
+                        IconButton(onClick = {
+                            scope.launch { drawerState.open() }
+                            // 打开菜单即刷新：可用模型列表 + 历史会话列表
+                            vm.loadModels()
+                            vm.refreshConversationsFromServer()
+                        }) {
                             Icon(
                                 imageVector = Icons.Filled.Menu,
                                 contentDescription = "菜单",
