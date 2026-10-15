@@ -6,11 +6,17 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
@@ -77,12 +83,27 @@ object ChatColors {
  * 用 ModalNavigationDrawer 包裹：左上角菜单按钮可展开抽屉，
  * 抽屉上半部分选模型、下半部分是对话历史。
  */
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun ChatScreen(vm: ChatViewModel) {
     val listState = rememberLazyListState()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
+    // 用于点击输入框外部时收起软键盘
+    val focusManager = LocalFocusManager.current
+
+    // 软键盘弹出/收起的流畅过渡：用“目标 IME 高度”驱动 animateDpAsState，
+    // 自定义时长与缓动，保证所有系统版本上输入框上移/下落都平滑有动画。
+    val density = LocalDensity.current
+    val imeTargetBottom = WindowInsets.imeAnimationTarget.getBottom(density)
+    val navBottom = WindowInsets.navigationBars.getBottom(density)
+    // Scaffold 的 padding 已包含导航栏高度，这里只补“键盘超出导航栏”的部分，避免重复留白
+    val extraImeBottom = with(density) { (imeTargetBottom - navBottom).coerceAtLeast(0).toDp() }
+    val animatedImeBottom by animateDpAsState(
+        targetValue = extraImeBottom,
+        animationSpec = tween(durationMillis = 250, easing = FastOutSlowInEasing),
+        label = "imeBottom"
+    )
 
     // 流式输出时的"自动滚到底"：
     // 不能只监听 messages.size（流式是往同一条消息里追加内容，size 不变），
@@ -230,6 +251,8 @@ fun ChatScreen(vm: ChatViewModel) {
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(padding)
+                    // 软键盘弹出时，用带缓动的动画 padding 把底部输入框平滑顶到键盘上方
+                    .padding(bottom = animatedImeBottom)
             ) {
                 // 用 Box 包住列表：加载更早的菊花作为【覆盖层】显示在顶部，
                 // 不占用列表项 -> 不改变项数与布局 -> prepend 时不抖动。
@@ -237,6 +260,10 @@ fun ChatScreen(vm: ChatViewModel) {
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
+                        // 点击消息区空白处收起软键盘（像常见聊天软件一样）
+                        .pointerInput(Unit) {
+                            detectTapGestures(onTap = { focusManager.clearFocus() })
+                        }
                 ) {
                     LazyColumn(
                         state = listState,

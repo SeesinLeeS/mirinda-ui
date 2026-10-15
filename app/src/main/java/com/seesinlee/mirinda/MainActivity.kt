@@ -3,6 +3,7 @@ package com.seesinlee.mirinda
 import android.content.Intent
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.setContent
 import androidx.activity.viewModels
 import androidx.compose.foundation.layout.fillMaxSize
@@ -20,6 +21,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 全屏绘制（edge-to-edge），确保软键盘 inset 正常上报，供输入框过渡动画使用
+        enableEdgeToEdge()
 
         // App 启动时：初始化本地 token 缓存（没有则自动生成），并做登录校验
         TokenStore.init(applicationContext)
