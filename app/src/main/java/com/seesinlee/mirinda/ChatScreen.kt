@@ -36,6 +36,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -331,7 +332,7 @@ fun ChatScreen(vm: ChatViewModel) {
                         // prepend 后该消息被下推、firstVisibleItemIndex 变大，
                         // isNearTop 自然变 false，不会反复触发加载。
                         items(vm.messages, key = { it.id }) { msg ->
-                            MessageBubble(msg)
+                            MessageBubble(msg, onRetry = { vm.retryUserMessage(it) })
                         }
                         if (waitingFirstChunk) {
                             item { TypingIndicator() }
@@ -715,15 +716,37 @@ fun SettingsDialog(vm: ChatViewModel, onDismiss: () -> Unit) {
 
 /** 单条消息气泡 */
 @Composable
-fun MessageBubble(msg: ChatMessage) {
+fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
     val isUser = msg.role == Role.USER
 
     if (isUser) {
         // 用户消息：简洁的圆角矩形气泡，靠右展示
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.End
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically
         ) {
+            // 请求失败：在气泡左侧显示"重试"按钮，点击后重新发送该气泡内容
+            if (msg.failed) {
+                Surface(
+                    shape = CircleShape,
+                    color = Color.White.copy(alpha = 0.08f),
+                    border = BorderStroke(1.dp, ChatColors.InputBorder),
+                    modifier = Modifier
+                        .size(30.dp)
+                        .clickable { onRetry(msg.id) }
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Filled.Refresh,
+                            contentDescription = "重试",
+                            tint = ChatColors.TextSecondary,
+                            modifier = Modifier.size(16.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.width(8.dp))
+            }
             Surface(
                 color = ChatColors.UserBubble,
                 contentColor = ChatColors.TextPrimary,

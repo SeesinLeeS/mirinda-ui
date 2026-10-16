@@ -697,7 +697,8 @@ class ChatViewModel : ViewModel() {
         if (text.isNotBlank()) blocks.add(ContentBlock.Text(text))
         pendingImages.forEach { blocks.add(ContentBlock.Image(localUri = it)) }
 
-        messages.add(ChatMessage(id = newId(), role = Role.USER, blocks = blocks))
+        val userId = newId()
+        messages.add(ChatMessage(id = userId, role = Role.USER, blocks = blocks))
 
         // 用第一条用户文字更新对话标题
         maybeUpdateTitle(text)
@@ -705,8 +706,36 @@ class ChatViewModel : ViewModel() {
         // 清空待发送图片
         pendingImages.clear()
 
+        startStreaming(userId, text)
+    }
+
+    /**
+     * 重试某条失败的用户消息：重新发送该气泡的内容（文字 + 本地图片）。
+     * 不重复插入用户气泡，仅清除失败标记并重新发起一次流式请求。
+     */
+    fun retryUserMessage(userId: String) {
+        if (isLoading.value) return
+        val idx = messages.indexOfFirst { it.id == userId }
+        if (idx < 0) return
+        val userMsg = messages[idx]
+        // 取出该气泡里的文字（多块用换行拼接）
+        val text = userMsg.blocks
+            .filterIsInstance<ContentBlock.Text>()
+            .joinToString("\n") { it.text }
+            .trim()
+        if (text.isBlank()) return
+        // 清除失败标记
+        messages[idx] = userMsg.copy(failed = false)
+        startStreaming(userId, text)
+    }
+
+    /**
+     * 发起一次流式请求：插入助手占位气泡，并持有请求协程。
+     * @param userId  触发本次请求的用户消息 id（请求失败时用以标记可重试）
+     * @param userText 发送给后端的正文（图片仅在本地气泡预览，后端暂不支持）
+     */
+    private fun startStreaming(userId: String, userText: String) {
         val modelId = selectedModel.value?.id ?: "deepseek-flash"
-        val userText = text
 
         // ---- 插入助手占位消息，用于流式追加 ----
         val assistantId = newId()
@@ -735,9 +764,21 @@ class ChatViewModel : ViewModel() {
         sendJob = viewModelScope.launch {
             ChatApi.sendStream(userText, modelId, conversationId)
                 .catch { e ->
-                    // 出错：把错误显示在助手气泡里
-                    val msg = "请求失败：${e.message ?: e.toString()}"
-                    updateAssistant(assistantId, reasoning.toString(), msg, streaming = false)
+                    // 请求失败：不再把错误写进助手气泡，
+                    // 而是把触发本次请求的用户气泡标记为"可重试"（气泡左侧显示重试按钮）。
+                    val uIdx = messages.indexOfFirst { it.id == userId }
+                    if (uIdx >= 0) messages[uIdx] = messages[uIdx].copy(failed = true)
+                    // 若助手占位气泡还没有任何实际内容，则移除它，避免留下空气泡
+                    val aIdx = messages.indexOfFirst { it.id == assistantId }
+                    if (aIdx >= 0) {
+                        val a = messages[aIdx]
+                        val hasContent = a.blocks.any { b ->
+                            (b is ContentBlock.Text && b.text.isNotBlank()) ||
+                            (b is ContentBlock.Reasoning && b.text.isNotBlank()) ||
+                            b is ContentBlock.Image
+                        }
+                        if (!hasContent) messages.removeAt(aIdx)
+                    }
                 }
                 .onCompletion {
                     isLoading.value = false

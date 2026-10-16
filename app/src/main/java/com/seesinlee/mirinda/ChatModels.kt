@@ -42,12 +42,15 @@ sealed class ContentBlock {
  * @param role        谁发的
  * @param blocks      内容块列表（图文 + 推理混排）
  * @param isStreaming 是否正在流式输出中
+ * @param failed      该消息（用户消息）对应的请求是否失败，
+ *                    失败时不展示错误文案，改为在气泡左侧显示"重试"按钮
  */
 data class ChatMessage(
     val id: String,
     val role: Role,
     val blocks: List<ContentBlock>,
-    val isStreaming: Boolean = false
+    val isStreaming: Boolean = false,
+    val failed: Boolean = false
 )
 
 /**
