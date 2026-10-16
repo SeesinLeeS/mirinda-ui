@@ -56,6 +56,53 @@ import kotlinx.coroutines.launch
 import coil.compose.AsyncImage
 
 /* ============================================================
+ *  中断标记：出现在 agent 文本/思考结尾，需从正文剥离后单独用气泡展示。
+ *  形如 "\n\n（用户中断）" 或 "\n\n（回答中断，未完成）"。
+ * ============================================================ */
+private val INTERRUPT_SUFFIXES = listOf(
+    "\n\n（用户中断）" to "用户中断",
+    "\n\n（回答中断，未完成）" to "回答中断，未完成"
+)
+
+/**
+ * 从文本尾部剥离中断标记。
+ * @return 净化后的文本 与 命中的气泡标签（无命中则标签为 null）。
+ */
+private fun stripInterruption(raw: String): Pair<String, String?> {
+    for ((suffix, label) in INTERRUPT_SUFFIXES) {
+        if (raw.endsWith(suffix)) {
+            return raw.removeSuffix(suffix).trimEnd() to label
+        }
+    }
+    return raw to null
+}
+
+/** 处理结果：净化后的块列表 + 收集到的中断标签（去重、保序）。 */
+private data class StrippedBlocks(val blocks: List<ContentBlock>, val interruptions: List<String>)
+
+/** 遍历消息块，剥离文本/推理块尾部的中断标记并收集中断标签。 */
+private fun stripInterruptions(blocks: List<ContentBlock>): StrippedBlocks {
+    val out = mutableListOf<ContentBlock>()
+    val interrupts = mutableListOf<String>()
+    for (block in blocks) {
+        when (block) {
+            is ContentBlock.Text -> {
+                val (t, label) = stripInterruption(block.text)
+                out.add(ContentBlock.Text(t))
+                label?.let { if (it !in interrupts) interrupts.add(it) }
+            }
+            is ContentBlock.Reasoning -> {
+                val (t, label) = stripInterruption(block.text)
+                out.add(ContentBlock.Reasoning(t))
+                label?.let { if (it !in interrupts) interrupts.add(it) }
+            }
+            is ContentBlock.Image -> out.add(block)
+        }
+    }
+    return StrippedBlocks(out, interrupts)
+}
+
+/* ============================================================
  *  配色（深蓝主题）—— 想换色改这里即可
  * ============================================================ */
 // 主界面配色：全部引用全局 AppColors（唯一色值来源在 AppColors.kt）
@@ -698,8 +745,10 @@ fun MessageBubble(msg: ChatMessage) {
     } else {
         // 助手消息：不包气泡，直接平铺（左对齐，近白文字适配深蓝背景）
         // 其中"推理块"单独用可折叠的深度思考面板展示，实现"先思考、再回复"。
-        val reasoningBlock = msg.blocks.filterIsInstance<ContentBlock.Reasoning>().firstOrNull()
-        val otherBlocks = msg.blocks.filterNot { it is ContentBlock.Reasoning }
+        // 结尾若带 "\n\n（xxx中断）" 标记，则剥离该标记（不进正文），并单独用气泡展示括号内容。
+        val stripped = stripInterruptions(msg.blocks)
+        val reasoningBlock = stripped.blocks.filterIsInstance<ContentBlock.Reasoning>().firstOrNull()
+        val otherBlocks = stripped.blocks.filterNot { it is ContentBlock.Reasoning }
         val hasReply = otherBlocks.any {
             (it is ContentBlock.Text && it.text.isNotBlank()) || it is ContentBlock.Image
         }
@@ -718,6 +767,12 @@ fun MessageBubble(msg: ChatMessage) {
                 Spacer(Modifier.height(8.dp))
             }
             otherBlocks.forEach { block -> MessageBlock(block, ChatColors.TextPrimary) }
+
+            // 中断标记气泡：左对齐小气泡，风格与"深度思考"面板一致
+            stripped.interruptions.forEach { label ->
+                Spacer(Modifier.height(8.dp))
+                InterruptionBubble(label)
+            }
         }
     }
 }
@@ -752,6 +807,32 @@ private fun MessageBlock(block: ContentBlock, textColor: Color = Color.Unspecifi
                         .clip(RoundedCornerShape(12.dp))
                 )
             }
+        }
+    }
+}
+
+/**
+ * 中断标记气泡：当 agent 文本/思考结尾带有 "\n\n（xxx中断）" 时，
+ * 抽取括号内容，用与整体 UI 一致的小气泡单独展示（左对齐，呼应助手消息）。
+ */
+@Composable
+private fun InterruptionBubble(label: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Start
+    ) {
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = ChatColors.ReasoningBg,
+            border = BorderStroke(1.dp, ChatColors.ReasoningBorder),
+            modifier = Modifier.widthIn(max = 280.dp)
+        ) {
+            Text(
+                text = label,
+                color = ChatColors.ReasoningText,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
+            )
         }
     }
 }
