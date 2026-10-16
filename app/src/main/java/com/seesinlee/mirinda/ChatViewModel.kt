@@ -97,6 +97,18 @@ class ChatViewModel : ViewModel() {
     /** 是否正在加载更早的历史消息（UI 顶部显示加载指示） */
     val isLoadingMore = mutableStateOf(false)
 
+    /** 对话历史【列表】分页：当前已加载到的页码（page=1 为第一页） */
+    private var conversationListPage = 1
+
+    /** 对话历史【列表】是否还有下一页可加载（UI 滑到底部据此决定是否加载更多） */
+    val hasMoreConversations = mutableStateOf(false)
+
+    /** 是否正在加载对话历史列表的下一页（UI 底部显示加载指示） */
+    val isLoadingMoreConversations = mutableStateOf(false)
+
+    /** 对话历史列表分页大小 */
+    private val CONVERSATION_PAGE_SIZE = 10
+
     /**
      * “滚动到最新一条底部”的一次性信号：每自增一次，UI 就把列表定位到最后。
      * 用于：进入/切换会话、历史首页加载完成等“应当定位到最新消息底部”的时机。
@@ -222,17 +234,17 @@ class ChatViewModel : ViewModel() {
                 if (r.ok) {
                     loginState.value = LoginState.SUCCESS
                     loginMessage.value = ""
-                    // 登录成功后启动心跳轮询，由心跳维持在线状态
-                    startHeartbeat()
                 } else {
                     loginState.value = LoginState.FAILED
                     loginMessage.value = "登录失败（HTTP ${r.httpCode}，code=${r.bizCode}）${r.message}"
-                    stopHeartbeat()
                 }
             } catch (e: Exception) {
                 loginState.value = LoginState.FAILED
                 loginMessage.value = "登录失败：${e.message}"
-                stopHeartbeat()
+            } finally {
+                // 无论登录成功还是失败，都要保证心跳在跑：
+                // 失败时靠心跳持续探测，等网络恢复（心跳从非 200 变 200）后自动重连。
+                startHeartbeat()
             }
         }
     }
@@ -250,19 +262,39 @@ class ChatViewModel : ViewModel() {
 
     /**
      * 启动心跳轮询：每 1s 请求一次 /user/heartbeat，根据结果刷新登录状态小圆点。
-     * 通 → SUCCESS，不通 → FAILED；轮询不会因失败而停止，便于网络恢复后自动变回在线。
+     * 通 → SUCCESS，不通 → FAILED；轮询不会因失败（含登录失败）而停止，
+     * 便于网络恢复后自动变回在线，并在“重新连上”的瞬间自动重连拉数据。
+     *
+     * 关键：当心跳结果从“非 200（断开）”跳变为“200（连上）”时，
+     * 视为重新连接成功，自动触发一次 login + 拉模型列表 + 拉历史对话列表。
      */
     private fun startHeartbeat() {
-        stopHeartbeat()
+        // 已在运行则不重复启动：避免重连时 login() 再次调用本方法把正在跑的心跳取消掉
+        if (heartbeatJob?.isActive == true) return
         heartbeatJob = viewModelScope.launch {
+            // 记录上一次心跳是否连通，用于识别“断开 -> 连上”的跳变；初始为 null（未知）
+            var prevOk: Boolean? = null
             while (isActive) {
                 val ok = ChatApi.heartbeat()
-                loginState.value = if (ok) LoginState.SUCCESS else LoginState.FAILED
-                if (!ok && loginMessage.value.isBlank()) {
-                    loginMessage.value = "心跳失败，连接已断开"
-                } else if (ok) {
-                    loginMessage.value = ""
+
+                // 从“非 200”变为“200”（重新连接上）：重新登录 + 刷新模型列表 + 刷新历史对话列表
+                if (prevOk == false && ok) {
+                    login()
+                    loadModels()
+                    refreshConversationsFromServer()
                 }
+
+                // 用心跳结果驱动登录状态小圆点；登录流程进行中（LOADING）时让位给 login()，避免状态抖动
+                if (loginState.value != LoginState.LOADING) {
+                    loginState.value = if (ok) LoginState.SUCCESS else LoginState.FAILED
+                    if (ok) {
+                        loginMessage.value = ""
+                    } else if (loginMessage.value.isBlank()) {
+                        loginMessage.value = "心跳失败，连接已断开"
+                    }
+                }
+
+                prevOk = ok
                 delay(1000)
             }
         }
@@ -328,7 +360,7 @@ class ChatViewModel : ViewModel() {
     fun refreshConversationsFromServer() {
         viewModelScope.launch {
             try {
-                val remote = ChatApi.fetchConversations(page = 1, pageSize = 50)
+                val remote = ChatApi.fetchConversations(page = 1, pageSize = CONVERSATION_PAGE_SIZE)
 
                 // 1) 取唯一草稿：优先当前会话正用的草稿，其次列表里第一个草稿，都没有则新建一个
                 val draft = conversations.firstOrNull { it.id == currentConversationId.value && it.serverId.isBlank() }
@@ -351,6 +383,10 @@ class ChatViewModel : ViewModel() {
                 conversations.clear()
                 conversations.addAll(rebuilt)
 
+                // 刷新即回到第一页：记录页码，并据“本页是否满页”判断还有没有下一页
+                conversationListPage = 1
+                hasMoreConversations.value = remote.size >= CONVERSATION_PAGE_SIZE
+
                 // 当前会话若在重建后已不存在（例如多余草稿被合并清理），切回保留的草稿
                 if (conversations.none { it.id == currentConversationId.value }) {
                     currentConversationId.value = draft.id
@@ -358,6 +394,43 @@ class ChatViewModel : ViewModel() {
                 }
             } catch (e: Exception) {
                 errorMessage.value = "加载历史对话失败：${e.message}"
+            }
+        }
+    }
+
+    /**
+     * 加载对话历史【列表】的下一页，并【追加】到现有列表末尾。
+     *  - 由抽屉里的列表滑到底部附近时触发；
+     *  - 复用已有本地条目（保留其 local id 与消息缓存），按 serverId 去重；
+     *  - 草稿（serverId 为空）始终留在首位，新增远程会话只往末尾追加。
+     */
+    fun loadMoreConversations() {
+        if (isLoadingMoreConversations.value || !hasMoreConversations.value) return
+        isLoadingMoreConversations.value = true
+        viewModelScope.launch {
+            try {
+                val nextPage = conversationListPage + 1
+                val remote = ChatApi.fetchConversations(page = nextPage, pageSize = CONVERSATION_PAGE_SIZE)
+
+                remote.forEach { b ->
+                    if (b.serverId.isBlank()) return@forEach
+                    val idx = conversations.indexOfFirst { it.serverId == b.serverId }
+                    if (idx >= 0) {
+                        // 已存在：更新 title / createdAt，保留 local id 与消息缓存
+                        conversations[idx] = conversations[idx].copy(title = b.title, createdAt = b.createdAt)
+                    } else {
+                        conversations.add(
+                            Conversation(id = newId(), serverId = b.serverId, title = b.title, createdAt = b.createdAt)
+                        )
+                    }
+                }
+
+                conversationListPage = nextPage
+                hasMoreConversations.value = remote.size >= CONVERSATION_PAGE_SIZE
+            } catch (e: Exception) {
+                errorMessage.value = "加载更多历史对话失败：${e.message}"
+            } finally {
+                isLoadingMoreConversations.value = false
             }
         }
     }

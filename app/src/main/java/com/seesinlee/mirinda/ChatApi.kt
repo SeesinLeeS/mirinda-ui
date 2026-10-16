@@ -30,7 +30,7 @@ object ChatApi {
     /**
      * 后端地址。
      */
-    private const val BASE_URL = "http://10.83.254.19:9090"
+    private const val BASE_URL = "http://10.83.254.39:9090"
 
     /** 流式事件类型 */
     sealed class StreamEvent {
@@ -126,7 +126,7 @@ object ChatApi {
      * 拉取当前用户的历史对话列表：GET /agent/conversation?page=&page_size=（带 x-user-token 头）。
      * 返回 ConversationBrief 列表（后端 data.data 数组，字段 id/title/created_at）。
      */
-    suspend fun fetchConversations(page: Int = 1, pageSize: Int = 50): List<ConversationBrief> =
+    suspend fun fetchConversations(page: Int = 1, pageSize: Int = 10): List<ConversationBrief> =
         withContext(Dispatchers.IO) {
             val url = URL("$BASE_URL/agent/conversation?page=$page&page_size=$pageSize")
             val conn = (url.openConnection() as HttpURLConnection).apply {

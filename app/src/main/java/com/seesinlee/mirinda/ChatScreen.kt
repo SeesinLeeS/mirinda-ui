@@ -43,6 +43,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.layout.ContentScale
@@ -183,6 +186,7 @@ fun ChatScreen(vm: ChatViewModel) {
                 CenterAlignedTopAppBar(
                     navigationIcon = {
                         IconButton(onClick = {
+                            focusManager.clearFocus()   // 点菜单栏也收起软键盘
                             scope.launch { drawerState.open() }
                             // 打开菜单即刷新：可用模型列表 + 历史会话列表
                             vm.loadModels()
@@ -218,22 +222,6 @@ fun ChatScreen(vm: ChatViewModel) {
             },
             containerColor = ChatColors.PageBg   // 整个页面深蓝背景
         ) { padding ->
-            // 模型加载失败：顶部红色横幅直接报错（不做静默兜底）
-            vm.errorMessage.value?.let { err ->
-                Surface(
-                    color = Color(0xFF5A1A1A),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(padding)
-                ) {
-                    Text(
-                        text = err,
-                        color = Color(0xFFFFD6D6),
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
-                    )
-                }
-            }
             // 只有在"助手占位消息还一个字都没吐出来"时，才单独显示底部"思考中"动效；
             // 一旦开始流式输出（推理或正文），就由气泡内的"深度思考"面板接管提示。
             val lastMsg = vm.messages.lastOrNull()
@@ -253,17 +241,34 @@ fun ChatScreen(vm: ChatViewModel) {
                     .padding(padding)
                     // 软键盘弹出时，用带缓动的动画 padding 把底部输入框平滑顶到键盘上方
                     .padding(bottom = animatedImeBottom)
+                    // 点击输入框以外的任意区域（消息区/空白）都收起软键盘；
+                    // 输入框内部的点击会被其自身消费，不会触发这里。
+                    .pointerInput(Unit) {
+                        detectTapGestures(onTap = { focusManager.clearFocus() })
+                    }
             ) {
+                // 模型加载/网络失败：红色横幅横在消息列表上方，占据自身布局高度，
+                // 不与消息气泡、"已深度思考"面板叠放，避免被遮挡。
+                vm.errorMessage.value?.let { err ->
+                    Surface(
+                        color = Color(0xFF5A1A1A),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = err,
+                            color = Color(0xFFFFD6D6),
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp)
+                        )
+                    }
+                }
+
                 // 用 Box 包住列表：加载更早的菊花作为【覆盖层】显示在顶部，
                 // 不占用列表项 -> 不改变项数与布局 -> prepend 时不抖动。
                 Box(
                     modifier = Modifier
                         .weight(1f)
                         .fillMaxWidth()
-                        // 点击消息区空白处收起软键盘（像常见聊天软件一样）
-                        .pointerInput(Unit) {
-                            detectTapGestures(onTap = { focusManager.clearFocus() })
-                        }
                 ) {
                     LazyColumn(
                         state = listState,
@@ -333,6 +338,22 @@ fun AppDrawer(
 
         if (showSettings) {
             SettingsDialog(vm = vm, onDismiss = { showSettings = false })
+        }
+
+        // 对话历史列表的滚动状态：用于“滑到底部附近自动加载下一页”
+        val convListState = rememberLazyListState()
+        val isNearConvBottom by remember {
+            derivedStateOf {
+                val info = convListState.layoutInfo
+                val last = info.visibleItemsInfo.lastOrNull()?.index ?: -1
+                // 已渲染到倒数第 3 项之内就算接近底部（列表为空时不触发）
+                info.totalItemsCount > 0 && last >= info.totalItemsCount - 3
+            }
+        }
+        LaunchedEffect(isNearConvBottom, vm.hasMoreConversations.value, vm.isLoadingMoreConversations.value) {
+            if (isNearConvBottom && vm.hasMoreConversations.value && !vm.isLoadingMoreConversations.value) {
+                vm.loadMoreConversations()
+            }
         }
 
         Column(
@@ -449,12 +470,17 @@ fun AppDrawer(
             Spacer(Modifier.height(8.dp))
 
             LazyColumn(
+                state = convListState,
                 modifier = Modifier
                     .weight(1f)
                     .fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                items(vm.conversations, key = { it.id }) { conv ->
+                // 只展示后端返回的历史会话（serverId 非空），不展示本地“新对话”草稿
+                items(
+                    vm.conversations.filter { it.serverId.isNotBlank() },
+                    key = { it.id }
+                ) { conv ->
                     val current = vm.currentConversationId.value == conv.id
                     Surface(
                         shape = RoundedCornerShape(10.dp),
@@ -501,6 +527,24 @@ fun AppDrawer(
                                     modifier = Modifier.size(18.dp)
                                 )
                             }
+                        }
+                    }
+                }
+
+                // 列表底部：加载下一页时显示的菊花
+                if (vm.isLoadingMoreConversations.value) {
+                    item(key = "__conv_loading_more__") {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 10.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(20.dp),
+                                strokeWidth = 2.dp,
+                                color = ChatColors.TextSecondary
+                            )
                         }
                     }
                 }
@@ -832,6 +876,8 @@ fun InputBar(
 ) {
     var text by remember { mutableStateOf(TextFieldValue("")) }
     var isFocused by remember { mutableStateOf(false) }   // 是否聚焦 -> 控制 hover 效果
+    // 让“点击整个输入框区域”都能聚焦到文本框并弹出软键盘
+    val focusRequester = remember { FocusRequester() }
 
     val maxImages = 9                    // 最多可添加的图片数
     val tileSize = 54.dp                 // 缩略图 / "+" 格子的尺寸
@@ -876,7 +922,13 @@ fun InputBar(
                 shape = RoundedCornerShape(24.dp),
                 color = containerColor,
                 border = BorderStroke(borderWidth, borderColor),
-                modifier = Modifier.fillMaxWidth()
+                modifier = Modifier
+                    .fillMaxWidth()
+                    // 点击整个输入框（含内边距/空白）都聚焦文本框并弹出键盘；无点击涟漪
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null
+                    ) { focusRequester.requestFocus() }
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
 
@@ -966,6 +1018,7 @@ fun InputBar(
                             maxLines = 6,
                             modifier = Modifier
                                 .fillMaxWidth()
+                                .focusRequester(focusRequester)               // 绑定，供整框点击时聚焦
                                 .onFocusChanged { isFocused = it.isFocused }  // 聚焦状态
                         )
                     }
