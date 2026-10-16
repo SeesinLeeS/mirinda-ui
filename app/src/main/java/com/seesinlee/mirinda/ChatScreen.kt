@@ -15,6 +15,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.foundation.rememberScrollState
@@ -55,6 +56,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
 
 /* ============================================================
  *  中断标记：出现在 agent 文本/思考结尾，需从正文剥离后单独用气泡展示。
@@ -189,7 +191,9 @@ fun ChatScreen(vm: ChatViewModel) {
         val total = listState.layoutInfo.totalItemsCount
         if (total > 0 && isNearBottom) {
             // 大 offset 确保最后一项贴到视口底部（而非顶部对齐）
-            listState.scrollToItem(total - 1, 1_000_000)
+            // coerceIn 兜底：滚动过程中列表长度可能变化，避免 scrollToItem 越界崩溃
+            val idx = (total - 1).coerceIn(0, total - 1)
+            listState.scrollToItem(idx, 1_000_000)
         }
     }
 
@@ -198,9 +202,11 @@ fun ChatScreen(vm: ChatViewModel) {
     LaunchedEffect(vm.scrollToBottomSignal.value) {
         if (vm.messages.isNotEmpty()) {
             repeat(4) {
-                val last = (listState.layoutInfo.totalItemsCount - 1).coerceAtLeast(0)
-                // 大 offset 把最后一项推到视口底部（而非顶部对齐），LazyColumn 会自动 clamp
-                listState.scrollToItem(last, 1_000_000)
+                val total = listState.layoutInfo.totalItemsCount
+                if (total > 0) {
+                    // 大 offset 把最后一项推到视口底部（而非顶部对齐），LazyColumn 会自动 clamp
+                    listState.scrollToItem(total - 1, 1_000_000)
+                }
                 delay(40)
             }
         }
@@ -818,8 +824,15 @@ private fun MessageBlock(block: ContentBlock, textColor: Color = Color.Unspecifi
         is ContentBlock.Image -> {
             val model: Any? = block.localUri ?: block.remoteUrl
             if (model != null) {
+                // 关键：限制解码尺寸（最长边 720px），避免历史里大图在全设备（尤其低配真机/模拟器）
+                // 上因原图过大而 OOM 崩溃；远程/本地图统一走 Coil 的降采样与磁盘缓存。
+                val imageRequest = ImageRequest.Builder(LocalContext.current)
+                    .data(model)
+                    .size(720)
+                    .crossfade(true)
+                    .build()
                 AsyncImage(
-                    model = model,
+                    model = imageRequest,
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier

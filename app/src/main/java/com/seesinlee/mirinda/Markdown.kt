@@ -57,7 +57,11 @@ fun MarkdownText(
     color: Color,
     modifier: Modifier = Modifier
 ) {
-    val blocks = remember(markdown) { parseMarkdown(markdown) }
+    // 解析失败也绝不崩溃（单条畸形/超长历史消息不应拖垮整个列表）：兜底成一段纯文本
+    val blocks = remember(markdown) {
+        runCatching { parseMarkdown(markdown) }
+            .getOrDefault(listOf(MdBlock.Paragraph(markdown)))
+    }
 
     Column(modifier = modifier) {
         blocks.forEachIndexed { index, block ->
