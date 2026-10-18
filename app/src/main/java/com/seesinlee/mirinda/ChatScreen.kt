@@ -31,6 +31,9 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Stop
@@ -1000,6 +1003,7 @@ fun InputBar(
     var isFocused by remember { mutableStateOf(false) }   // 是否聚焦 -> 控制 hover 效果
     // 让“点击整个输入框区域”都能聚焦到文本框并弹出软键盘
     val focusRequester = remember { FocusRequester() }
+    val focusManager = LocalFocusManager.current   // 发送后回收软键盘用
 
     val maxImages = 9                    // 最多可添加的图片数
     val tileSize = 54.dp                 // 缩略图 / "+" 格子的尺寸
@@ -1014,6 +1018,7 @@ fun InputBar(
         if (canSend) {
             onSend(text.text)
             text = TextFieldValue("")
+            focusManager.clearFocus()   // 发送后回收软键盘、输入框回落
         }
     }
 
@@ -1138,6 +1143,10 @@ fun InputBar(
                             ),
                             cursorBrush = SolidColor(ChatColors.InputBorderFocused),
                             maxLines = 6,
+                            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                            keyboardActions = KeyboardActions(
+                                onSend = { doSend() }   // 键盘“发送”键 -> 发送并回收键盘
+                            ),
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .focusRequester(focusRequester)               // 绑定，供整框点击时聚焦
