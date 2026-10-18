@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -762,12 +763,14 @@ fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
                 shadowElevation = 1.dp,
                 modifier = Modifier.widthIn(max = 300.dp)
             ) {
-                Column(
-                    modifier = Modifier.padding(
-                        horizontal = 16.dp, vertical = 11.dp
-                    )
-                ) {
-                    msg.blocks.forEach { block -> MessageBlock(block) }
+                SelectionContainer {
+                    Column(
+                        modifier = Modifier.padding(
+                            horizontal = 16.dp, vertical = 11.dp
+                        )
+                    ) {
+                        msg.blocks.forEach { block -> MessageBlock(block) }
+                    }
                 }
             }
         }
@@ -782,11 +785,12 @@ fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
             (it is ContentBlock.Text && it.text.isNotBlank()) || it is ContentBlock.Image
         }
 
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(end = 8.dp)
-        ) {
+        SelectionContainer {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(end = 8.dp)
+            ) {
             if (reasoningBlock != null && reasoningBlock.text.isNotBlank()) {
                 // thinking = 仍在思考且正文还没开始 -> 面板展开并显示"深度思考中…"
                 ReasoningPanel(
@@ -801,6 +805,7 @@ fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
             stripped.interruptions.forEach { label ->
                 Spacer(Modifier.height(8.dp))
                 InterruptionBubble(label)
+            }
             }
         }
     }

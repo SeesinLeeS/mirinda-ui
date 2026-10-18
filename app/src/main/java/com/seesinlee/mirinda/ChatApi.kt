@@ -30,7 +30,7 @@ object ChatApi {
     /**
      * 后端地址。
      */
-    private const val BASE_URL = "http://10.83.254.39:9090"
+    private const val BASE_URL = "http://192.168.3.34:9090"
 
     /** 流式事件类型 */
     sealed class StreamEvent {
