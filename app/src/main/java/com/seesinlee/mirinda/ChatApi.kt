@@ -1,5 +1,8 @@
 package com.seesinlee.mirinda
 
+import android.content.ContentResolver
+import android.content.Context
+import android.net.Uri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.isActive
@@ -7,6 +10,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
@@ -30,7 +34,13 @@ object ChatApi {
     /**
      * 后端地址。
      */
-    private const val BASE_URL = "http://192.168.3.34:9090"
+    private const val BASE_URL = "http://gs5956mf606.vicp.fun"
+
+    /**
+     * 由后端返回的 OBS key 拼出可访问的文件 URL：`{BASE_URL}/file/{key}`。
+     * 上传成功后把本函数生成的 URL 作为 files 字段传给 /agent/send。
+     */
+    fun fileUrl(key: String): String = "$BASE_URL/file/$key"
 
     /** 流式事件类型 */
     sealed class StreamEvent {
@@ -64,6 +74,100 @@ object ChatApi {
     /** 给连接统一加上 token 请求头 */
     private fun HttpURLConnection.applyAuth() {
         setRequestProperty(HEADER_TOKEN, TokenStore.getToken())
+    }
+
+    /**
+     * 上传文件：POST /file，使用 multipart/form-data。
+     *
+     * 表单字段：
+     *   - file：文件流（二进制）
+     *   - name：文件名称
+     *
+     * 后端成功时返回 { "code": ..., "data": "<obs key>", ... }，
+     * 这里把 data（OBS key）取出返回；调用方再用 [fileUrl] 拼成可访问 URL。
+     *
+     * @param uri     待上传文件的 Uri（图片选择/拍照得到）
+     * @param context 用于读取 Uri 的 ContentResolver（Application Context 即可）
+     * @return 后端返回的 OBS key 字符串
+     * @throws RuntimeException 读取失败 / 后端非 2xx / 未返回 key 时抛出
+     */
+    suspend fun uploadFile(uri: Uri, context: Context): String = withContext(Dispatchers.IO) {
+        val cr = context.contentResolver
+        val fileName = queryDisplayName(cr, uri)
+            ?: "upload_${System.currentTimeMillis()}.jpg"
+
+        val conn = (URL("$BASE_URL/file").openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            setRequestProperty("Accept", "application/json")
+            applyAuth()
+            connectTimeout = 30_000
+            readTimeout = 60_000
+        }
+
+        val boundary = "----MirindaBoundary${System.currentTimeMillis()}"
+        conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+        val crlf = "\r\n"
+        val dash = "--"
+
+        try {
+            val input = cr.openInputStream(uri)
+                ?: throw RuntimeException("无法读取图片文件：$uri")
+
+            input.use { src ->
+                conn.outputStream.use { out ->
+                    val writer = out.bufferedWriter(Charsets.UTF_8)
+
+                    // 字段：name
+                    writer.write("$dash$boundary$crlf")
+                    writer.write("Content-Disposition: form-data; name=\"name\"$crlf$crlf")
+                    writer.write(fileName)
+                    writer.write(crlf)
+                    writer.flush()   // 先落盘文本部分，再写二进制
+
+                    // 字段：file（二进制流）
+                    writer.write("$dash$boundary$crlf")
+                    writer.write("Content-Disposition: form-data; name=\"file\"; filename=\"$fileName\"$crlf")
+                    writer.write("Content-Type: application/octet-stream$crlf$crlf")
+                    writer.flush()
+                    src.copyTo(out)   // 直接以字节方式拷贝，避免把图片当文本编码
+                    out.flush()
+
+                    // 结束边界
+                    writer.write(crlf)
+                    writer.write("$dash$boundary$dash$crlf")
+                    writer.flush()
+                }
+            }
+
+            val code = conn.responseCode
+            if (code !in 200..299) {
+                val err = runCatching {
+                    conn.errorStream?.bufferedReader()?.use { it.readText() }
+                }.getOrNull().orEmpty()
+                throw RuntimeException("上传文件失败，服务端返回 $code：$err")
+            }
+
+            val body = conn.inputStream.bufferedReader().use { it.readText() }
+            val key = runCatching { JSONObject(body).optString("data") }.getOrNull().orEmpty()
+            if (key.isBlank()) {
+                throw RuntimeException("上传文件失败：后端未返回有效的文件 key（响应：$body）")
+            }
+            key
+        } finally {
+            conn.disconnect()
+        }
+    }
+
+    /** 从 Uri 取文件显示名（无则回 null）。 */
+    private fun queryDisplayName(cr: ContentResolver, uri: Uri): String? {
+        return runCatching {
+            cr.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)
+                ?.use { c ->
+                    val idx = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (c.moveToFirst() && idx >= 0) c.getString(idx) else null
+                }
+        }.getOrNull()
     }
 
     /**
@@ -304,8 +408,14 @@ object ChatApi {
      *
      * @param message 用户输入的文字
      * @param model   模型 id（例如 "deepseek-flash"）
+     * @param files   已上传文件的访问 URL 列表（形如 "{BASE_URL}/file/{key}"），无则空
      */
-    fun sendStream(message: String, model: String, conversationId: Int = 0): Flow<StreamEvent> = flow {
+    fun sendStream(
+        message: String,
+        model: String,
+        conversationId: Int = 0,
+        files: List<String> = emptyList()
+    ): Flow<StreamEvent> = flow {
         val url = URL("$BASE_URL/agent/send")
         val conn = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
@@ -317,13 +427,14 @@ object ChatApi {
             readTimeout = 60_000   // 两个 token 之间的最大等待；流式场景给足余量
         }
 
-        // ---- 请求体：{"message": "...", "model": "..."} ----
+        // ---- 请求体：{"message": "...", "model": "...", "files": [...]} ----
         // conversation_id 为 0 表示新对话，后端会新建会话并在 meta 事件里回传真实 id。
         // token 由 applyAuth() 放在 x-user-token 请求头里，无需再放进请求体。
         val payload = JSONObject()
             .put("message", message)
             .put("model", model)
             .put("conversation_id", conversationId)
+            .put("files", JSONArray(files))
             .toString()
 
         // try/finally 确保：无论正常结束、出错，还是"用户中断导致协程被取消"，

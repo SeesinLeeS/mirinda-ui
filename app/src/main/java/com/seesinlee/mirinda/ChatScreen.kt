@@ -992,10 +992,10 @@ fun ReasoningPanel(text: String, thinking: Boolean) {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun InputBar(
-    pendingImages: List<Uri>,
+    pendingImages: List<PendingImage>,
     isLoading: Boolean,
     onPickImage: (Uri) -> Unit,
-    onRemoveImage: (Uri) -> Unit,
+    onRemoveImage: (PendingImage) -> Unit,
     onSend: (String) -> Unit,
     onStop: () -> Unit
 ) {
@@ -1012,7 +1012,9 @@ fun InputBar(
         ActivityResultContracts.PickVisualMedia()
     ) { uri -> uri?.let(onPickImage) }
 
-    val canSend = !isLoading && (text.text.isNotBlank() || pendingImages.isNotEmpty())
+    // 有图片正在上传时禁用发送，避免把尚未拿到访问地址的图片发出去
+    val uploading = pendingImages.any { it.uploading }
+    val canSend = !isLoading && !uploading && (text.text.isNotBlank() || pendingImages.isNotEmpty())
 
     fun doSend() {
         if (canSend) {
@@ -1068,16 +1070,32 @@ fun InputBar(
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         // 已选图片缩略图
-                        pendingImages.forEach { uri ->
+                        pendingImages.forEach { img ->
                             Box(modifier = Modifier.size(tileSize)) {
                                 AsyncImage(
-                                    model = uri,
+                                    model = img.uri,
                                     contentDescription = null,
                                     contentScale = ContentScale.Crop,
                                     modifier = Modifier
                                         .fillMaxSize()
                                         .clip(RoundedCornerShape(10.dp))
                                 )
+                                // 上传中 / 失败 时的半透明遮罩提示
+                                if (img.uploading || img.failed) {
+                                    Surface(
+                                        color = Color.Black.copy(alpha = 0.5f),
+                                        shape = RoundedCornerShape(10.dp),
+                                        modifier = Modifier.fillMaxSize()
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Text(
+                                                text = if (img.uploading) "上传中" else "失败",
+                                                color = Color.White,
+                                                style = MaterialTheme.typography.labelSmall
+                                            )
+                                        }
+                                    }
+                                }
                                 Surface(
                                     color = Color.Black.copy(alpha = 0.55f),
                                     shape = CircleShape,
@@ -1085,7 +1103,7 @@ fun InputBar(
                                         .align(Alignment.TopEnd)
                                         .padding(3.dp)
                                         .size(20.dp)
-                                        .clickable { onRemoveImage(uri) }
+                                        .clickable { onRemoveImage(img) }
                                 ) {
                                     Icon(
                                         imageVector = Icons.Filled.Close,

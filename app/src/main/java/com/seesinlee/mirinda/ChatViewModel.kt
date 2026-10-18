@@ -1,9 +1,10 @@
 package com.seesinlee.mirinda
 
+import android.app.Application
 import android.net.Uri
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.lifecycle.ViewModel
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.flow.catch
 import kotlinx.coroutines.flow.onCompletion
@@ -24,15 +25,25 @@ import java.util.UUID
  *
  * sendMessage() 已接入后端 /agent/send（流式 SSE）。
  */
-class ChatViewModel : ViewModel() {
+/**
+ * 待发送图片：选图后立即上传，[fileUrl] 为上传成功后后端返回的访问地址。
+ */
+data class PendingImage(
+    val uri: Uri,
+    val fileUrl: String? = null,   // 上传成功后的访问 URL；未上传完/失败为 null
+    val uploading: Boolean = false,
+    val failed: Boolean = false
+)
+
+class ChatViewModel(application: Application) : AndroidViewModel(application) {
 
     // ============ 消息相关 ============
 
     // mutableStateListOf：一个"可被 Compose 观察"的列表，增删会自动触发 UI 刷新
     val messages = mutableStateListOf<ChatMessage>()
 
-    // 待发送的图片（输入框上方预览区的数据源）
-    val pendingImages = mutableStateListOf<Uri>()
+    // 待发送的图片（输入框上方预览区的数据源）：选图后立即上传，fileUrl 为访问地址
+    val pendingImages = mutableStateListOf<PendingImage>()
 
     // 是否正在等待回复（控制发送按钮：loading 时变为"终止"按钮）
     val isLoading = mutableStateOf(false)
@@ -664,12 +675,32 @@ class ChatViewModel : ViewModel() {
     //  图片
     // ===================================================================
 
+    /**
+     * 添加一张待发送图片：选图后立即上传到后端 OBS，
+     * 上传成功后把访问 URL 写回 [pendingImages]，发送时直接拼进 files。
+     */
     fun addPendingImage(uri: Uri) {
-        pendingImages.add(uri)
+        val item = PendingImage(uri = uri, uploading = true)
+        pendingImages.add(item)
+        viewModelScope.launch {
+            try {
+                val key = ChatApi.uploadFile(uri, getApplication<Application>())
+                val url = ChatApi.fileUrl(key)
+                val idx = pendingImages.indexOfFirst { it.uri == uri }
+                if (idx >= 0) {
+                    pendingImages[idx] = pendingImages[idx].copy(fileUrl = url, uploading = false)
+                }
+            } catch (e: Exception) {
+                val idx = pendingImages.indexOfFirst { it.uri == uri }
+                if (idx >= 0) {
+                    pendingImages[idx] = pendingImages[idx].copy(uploading = false, failed = true)
+                }
+            }
+        }
     }
 
-    fun removePendingImage(uri: Uri) {
-        pendingImages.remove(uri)
+    fun removePendingImage(target: PendingImage) {
+        pendingImages.removeAll { it.uri == target.uri }
     }
 
     // ===================================================================
@@ -693,9 +724,12 @@ class ChatViewModel : ViewModel() {
         if (isLoading.value) return  // 正在请求时不重复发送
 
         // ---- 组装用户消息：先放文字（若有），再放所有图片 ----
+        // 图片在选图时已上传，这里本地预览用 localUri，发送用的访问地址用 remoteUrl。
         val blocks = mutableListOf<ContentBlock>()
         if (text.isNotBlank()) blocks.add(ContentBlock.Text(text))
-        pendingImages.forEach { blocks.add(ContentBlock.Image(localUri = it)) }
+        pendingImages.forEach {
+            blocks.add(ContentBlock.Image(localUri = it.uri, remoteUrl = it.fileUrl))
+        }
 
         val userId = newId()
         messages.add(ChatMessage(id = userId, role = Role.USER, blocks = blocks))
@@ -703,10 +737,11 @@ class ChatViewModel : ViewModel() {
         // 用第一条用户文字更新对话标题
         maybeUpdateTitle(text)
 
-        // 清空待发送图片
+        // 收集已上传成功的访问地址（选图时已上传完），作为本次发送的 files
+        val files = pendingImages.mapNotNull { it.fileUrl }
         pendingImages.clear()
 
-        startStreaming(userId, text)
+        startStreaming(userId, text, files)
     }
 
     /**
@@ -723,18 +758,23 @@ class ChatViewModel : ViewModel() {
             .filterIsInstance<ContentBlock.Text>()
             .joinToString("\n") { it.text }
             .trim()
-        if (text.isBlank()) return
+        // 取出该气泡里图片已上传的访问地址（发送时已存进 remoteUrl）
+        val files = userMsg.blocks
+            .filterIsInstance<ContentBlock.Image>()
+            .mapNotNull { it.remoteUrl }
+        if (text.isBlank() && files.isEmpty()) return
         // 清除失败标记
         messages[idx] = userMsg.copy(failed = false)
-        startStreaming(userId, text)
+        startStreaming(userId, text, files)
     }
 
     /**
      * 发起一次流式请求：插入助手占位气泡，并持有请求协程。
-     * @param userId  触发本次请求的用户消息 id（请求失败时用以标记可重试）
-     * @param userText 发送给后端的正文（图片仅在本地气泡预览，后端暂不支持）
+     * @param userId   触发本次请求的用户消息 id（请求失败时用以标记可重试）
+     * @param userText 发送给后端的正文
+     * @param files    已上传图片的访问地址列表（选图时已完成上传），直接放进请求体 files
      */
-    private fun startStreaming(userId: String, userText: String) {
+    private fun startStreaming(userId: String, userText: String, files: List<String> = emptyList()) {
         val modelId = selectedModel.value?.id ?: "deepseek-flash"
 
         // ---- 插入助手占位消息，用于流式追加 ----
@@ -762,7 +802,7 @@ class ChatViewModel : ViewModel() {
         val conversationId = currentServerId.toIntOrNull() ?: 0
 
         sendJob = viewModelScope.launch {
-            ChatApi.sendStream(userText, modelId, conversationId)
+            ChatApi.sendStream(userText, modelId, conversationId, files = files)
                 .catch { e ->
                     // 请求失败：不再把错误写进助手气泡，
                     // 而是把触发本次请求的用户气泡标记为"可重试"（气泡左侧显示重试按钮）。
