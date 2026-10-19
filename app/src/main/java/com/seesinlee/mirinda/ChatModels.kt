@@ -26,13 +26,28 @@ sealed class ContentBlock {
     data class Reasoning(val text: String) : ContentBlock()
 
     /**
-     * 图片块。
-     * localUri: 手机本地图片地址
-     * remoteUrl: 将来后端返回的图片网址
+     * 图片块（单独成一个气泡，与文字内容分离）。
+     * localUri:  手机本地图片地址
+     * remoteUrl: 后端返回的图片网址
+     * fileName:  文件名（从本地选择或从链接解析，用于类型判断/展示）
      */
     data class Image(
         val localUri: Uri? = null,
-        val remoteUrl: String? = null
+        val remoteUrl: String? = null,
+        val fileName: String = ""
+    ) : ContentBlock()
+
+    /**
+     * 文件块：非图片的附件（xlsx / docx / pdf 等）。
+     * 单独成一个气泡，UI 用"文件卡片"（图标 + 文件名）展示。
+     * localUri:  手机本地文件地址（发送前预览用）
+     * remoteUrl: 后端返回的文件访问网址
+     * fileName:  文件名（决定图标/类型标签，从本地选择或从链接解析）
+     */
+    data class File(
+        val localUri: Uri? = null,
+        val remoteUrl: String? = null,
+        val fileName: String = ""
     ) : ContentBlock()
 }
 

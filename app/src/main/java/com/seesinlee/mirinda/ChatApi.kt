@@ -34,7 +34,7 @@ object ChatApi {
     /**
      * 后端地址。
      */
-    private const val BASE_URL = "http://gs5956mf606.vicp.fun"
+    private const val BASE_URL = "http://10.83.254.33:9090"
 
     /**
      * 由后端返回的 OBS key 拼出可访问的文件 URL：`{BASE_URL}/file/{key}`。
@@ -62,7 +62,7 @@ object ChatApi {
         val id: String,
         val role: String,        // "user" / "assistant"
         val part: String,        // 文本内容
-        val messageType: String  // question / reasoning / token / image
+        val messageType: String  // question / reasoning / token / image / file
     )
 
     /** 登录结果 */
@@ -158,6 +158,14 @@ object ChatApi {
             conn.disconnect()
         }
     }
+
+    /**
+     * 从 Uri 取文件显示名（供选择附件后在预览区展示、并据后缀判断图片/文件）。
+     * 取不到时回退一个带时间戳的占位名。
+     */
+    fun displayNameOf(uri: Uri, context: Context): String =
+        queryDisplayName(context.contentResolver, uri)
+            ?: "file_${System.currentTimeMillis()}"
 
     /** 从 Uri 取文件显示名（无则回 null）。 */
     private fun queryDisplayName(cr: ContentResolver, uri: Uri): String? {

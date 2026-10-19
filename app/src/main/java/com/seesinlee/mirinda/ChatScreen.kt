@@ -2,7 +2,6 @@ package com.seesinlee.mirinda
 
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
@@ -38,6 +37,14 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.TableChart
+import androidx.compose.material.icons.filled.PictureAsPdf
+import androidx.compose.material.icons.filled.FolderZip
+import androidx.compose.material.icons.filled.AudioFile
+import androidx.compose.material.icons.filled.VideoFile
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Menu
@@ -104,6 +111,7 @@ private fun stripInterruptions(blocks: List<ContentBlock>): StrippedBlocks {
                 label?.let { if (it !in interrupts) interrupts.add(it) }
             }
             is ContentBlock.Image -> out.add(block)
+            is ContentBlock.File -> out.add(block)
         }
     }
     return StrippedBlocks(out, interrupts)
@@ -368,10 +376,10 @@ fun ChatScreen(vm: ChatViewModel) {
                 }
 
                 InputBar(
-                    pendingImages = vm.pendingImages,
+                    pendingAttachments = vm.pendingAttachments,
                     isLoading = vm.isLoading.value,
-                    onPickImage = { vm.addPendingImage(it) },
-                    onRemoveImage = { vm.removePendingImage(it) },
+                    onPickAttachment = { vm.addPendingAttachment(it) },
+                    onRemoveAttachment = { vm.removePendingAttachment(it) },
                     onSend = { vm.sendMessage(it) },
                     onStop = { vm.stopGeneration() }
                 )
@@ -730,49 +738,45 @@ fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
     val isUser = msg.role == Role.USER
 
     if (isUser) {
-        // 用户消息：简洁的圆角矩形气泡，靠右展示
-        Row(
+        // 用户消息：文字 / 每张图片 / 每个文件各自成一个独立气泡，靠右展示（文字在上、附件在下）。
+        // 图片、文件不再塞进文字气泡，而是与文字内容分离、各占一行单独展示。
+        //
+        // 发送失败时：只展示文字内容气泡，隐藏图片/文件气泡，
+        // 这样"重试"按钮只需挂在文字气泡上即可；底层 blocks 仍保留附件，
+        // 点击重试会连同文件一起重新发送。
+        val visibleBlocks = if (msg.failed) {
+            msg.blocks.filter { it is ContentBlock.Text && it.text.isNotBlank() }
+        } else {
+            msg.blocks
+        }
+        Column(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.End,
-            verticalAlignment = Alignment.CenterVertically
+            horizontalAlignment = Alignment.End,
+            verticalArrangement = Arrangement.spacedBy(6.dp)
         ) {
-            // 请求失败：在气泡左侧显示"重试"按钮，点击后重新发送该气泡内容
-            if (msg.failed) {
-                Surface(
-                    shape = CircleShape,
-                    color = Color.White.copy(alpha = 0.08f),
-                    border = BorderStroke(1.dp, ChatColors.InputBorder),
-                    modifier = Modifier
-                        .size(30.dp)
-                        .clickable { onRetry(msg.id) }
+            if (visibleBlocks.isEmpty() && msg.failed) {
+                // 兜底：失败消息没有文字内容（例如仅发送了文件）时，
+                // 仍单独显示一个重试按钮，避免用户无法重发。
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            imageVector = Icons.Filled.Refresh,
-                            contentDescription = "重试",
-                            tint = ChatColors.TextSecondary,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
+                    RetryButton(onClick = { onRetry(msg.id) })
                 }
-                Spacer(Modifier.width(8.dp))
-            }
-            Surface(
-                color = ChatColors.UserBubble,
-                contentColor = ChatColors.TextPrimary,
-                shape = RoundedCornerShape(
-                    topStart = 20.dp, topEnd = 20.dp, bottomEnd = 0.dp, bottomStart = 20.dp
-                ),
-                shadowElevation = 1.dp,
-                modifier = Modifier.widthIn(max = 300.dp)
-            ) {
-                SelectionContainer {
-                    Column(
-                        modifier = Modifier.padding(
-                            horizontal = 16.dp, vertical = 11.dp
-                        )
+            } else {
+                visibleBlocks.forEachIndexed { index, block ->
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        msg.blocks.forEach { block -> MessageBlock(block) }
+                        // 请求失败：在（唯一的）文字气泡左侧显示"重试"按钮，点击后重新发送该消息
+                        if (msg.failed && index == 0) {
+                            RetryButton(onClick = { onRetry(msg.id) })
+                            Spacer(Modifier.width(8.dp))
+                        }
+                        UserBlockBubble(block)
                     }
                 }
             }
@@ -785,7 +789,8 @@ fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
         val reasoningBlock = stripped.blocks.filterIsInstance<ContentBlock.Reasoning>().firstOrNull()
         val otherBlocks = stripped.blocks.filterNot { it is ContentBlock.Reasoning }
         val hasReply = otherBlocks.any {
-            (it is ContentBlock.Text && it.text.isNotBlank()) || it is ContentBlock.Image
+            (it is ContentBlock.Text && it.text.isNotBlank()) ||
+                it is ContentBlock.Image || it is ContentBlock.File
         }
 
         SelectionContainer {
@@ -814,7 +819,7 @@ fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
     }
 }
 
-/** 消息内的单个内容块（文字 / 图片），气泡内外通用 */
+/** 消息内的单个内容块（文字 / 图片 / 文件），气泡内外通用 */
 @Composable
 private fun MessageBlock(block: ContentBlock, textColor: Color = Color.Unspecified) {
     when (block) {
@@ -829,26 +834,147 @@ private fun MessageBlock(block: ContentBlock, textColor: Color = Color.Unspecifi
             // 正常情况下推理块已在 MessageBubble 里单独处理；这里兜底渲染。
             ReasoningPanel(text = block.text, thinking = false)
         }
-        is ContentBlock.Image -> {
-            val model: Any? = block.localUri ?: block.remoteUrl
-            if (model != null) {
-                // 关键：限制解码尺寸（最长边 720px），避免历史里大图在全设备（尤其低配真机/模拟器）
-                // 上因原图过大而 OOM 崩溃；远程/本地图统一走 Coil 的降采样与磁盘缓存。
-                val imageRequest = ImageRequest.Builder(LocalContext.current)
-                    .data(model)
-                    .size(720)
-                    .crossfade(true)
-                    .build()
-                AsyncImage(
-                    model = imageRequest,
-                    contentDescription = null,
-                    contentScale = ContentScale.Crop,
-                    modifier = Modifier
-                        .padding(vertical = 4.dp)
-                        .widthIn(max = 260.dp)
-                        .fillMaxWidth()
-                        .heightIn(max = 220.dp)
-                        .clip(RoundedCornerShape(12.dp))
+        is ContentBlock.Image -> ImageBubble(block)
+        is ContentBlock.File -> FileBubble(block)
+    }
+}
+
+/** 请求失败时显示在气泡旁的"重试"小圆钮。 */
+@Composable
+private fun RetryButton(onClick: () -> Unit) {
+    Surface(
+        shape = CircleShape,
+        color = Color.White.copy(alpha = 0.08f),
+        border = BorderStroke(1.dp, ChatColors.InputBorder),
+        modifier = Modifier
+            .size(30.dp)
+            .clickable { onClick() }
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Icon(
+                imageVector = Icons.Filled.Refresh,
+                contentDescription = "重试",
+                tint = ChatColors.TextSecondary,
+                modifier = Modifier.size(16.dp)
+            )
+        }
+    }
+}
+
+/**
+ * 用户消息里的单个内容块，各自渲染成一个独立气泡：
+ *  - 文字 -> 圆角文字气泡；
+ *  - 图片 -> 独立图片气泡（与文字分离）；
+ *  - 文件 -> 文件卡片气泡（图标 + 文件名 + 类型）。
+ */
+@Composable
+private fun UserBlockBubble(block: ContentBlock) {
+    when (block) {
+        is ContentBlock.Text -> {
+            if (block.text.isBlank()) return
+            Surface(
+                color = ChatColors.UserBubble,
+                contentColor = ChatColors.TextPrimary,
+                shape = RoundedCornerShape(
+                    topStart = 20.dp, topEnd = 20.dp, bottomEnd = 0.dp, bottomStart = 20.dp
+                ),
+                shadowElevation = 1.dp,
+                modifier = Modifier.widthIn(max = 300.dp)
+            ) {
+                SelectionContainer {
+                    MarkdownText(
+                        markdown = block.text,
+                        color = ChatColors.TextPrimary,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 11.dp)
+                    )
+                }
+            }
+        }
+        is ContentBlock.Image -> ImageBubble(block)
+        is ContentBlock.File -> FileBubble(block)
+        is ContentBlock.Reasoning -> { /* 用户消息不含推理块，忽略 */ }
+    }
+}
+
+/** 图片气泡：单独成块展示一张图片（本地或远程）。 */
+@Composable
+private fun ImageBubble(block: ContentBlock.Image) {
+    val model: Any? = block.localUri ?: block.remoteUrl
+    if (model != null) {
+        // 关键：限制解码尺寸（最长边 720px），避免历史里大图在全设备（尤其低配真机/模拟器）
+        // 上因原图过大而 OOM 崩溃；远程/本地图统一走 Coil 的降采样与磁盘缓存。
+        val imageRequest = ImageRequest.Builder(LocalContext.current)
+            .data(model)
+            .size(720)
+            .crossfade(true)
+            .build()
+        AsyncImage(
+            model = imageRequest,
+            contentDescription = block.fileName.ifBlank { null },
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .widthIn(max = 220.dp)
+                .heightIn(max = 220.dp)
+                .clip(RoundedCornerShape(14.dp))
+        )
+    }
+}
+
+/**
+ * 文件卡片气泡：展示非图片文件（xlsx / docx / pdf 等）。
+ * 左侧按文件类型显示一个图标，右侧显示文件名与类型标签。
+ */
+@Composable
+private fun FileBubble(block: ContentBlock.File) {
+    val name = block.fileName.ifBlank { "文件" }
+    val ext = FileTypes.extensionOf(name)
+    val icon = when (ext) {
+        "xls", "xlsx", "csv" -> Icons.Filled.TableChart
+        "doc", "docx", "txt", "md", "rtf" -> Icons.Filled.Description
+        "pdf" -> Icons.Filled.PictureAsPdf
+        "zip", "rar", "7z", "tar", "gz" -> Icons.Filled.FolderZip
+        "mp3", "wav", "flac", "aac", "m4a" -> Icons.Filled.AudioFile
+        "mp4", "mov", "avi", "mkv", "webm" -> Icons.Filled.VideoFile
+        else -> Icons.Filled.InsertDriveFile
+    }
+    Surface(
+        color = ChatColors.UserBubble,
+        contentColor = ChatColors.TextPrimary,
+        shape = RoundedCornerShape(14.dp),
+        shadowElevation = 1.dp,
+        modifier = Modifier.widthIn(max = 260.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = ChatColors.Accent.copy(alpha = 0.9f),
+                modifier = Modifier.size(40.dp)
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = icon,
+                        contentDescription = null,
+                        tint = Color.White,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+            }
+            Spacer(Modifier.width(10.dp))
+            Column(modifier = Modifier.weight(1f, fill = false)) {
+                Text(
+                    text = name,
+                    color = ChatColors.TextPrimary,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = FileTypes.labelOf(name),
+                    color = ChatColors.TextSecondary,
+                    style = MaterialTheme.typography.labelSmall
                 )
             }
         }
@@ -992,10 +1118,10 @@ fun ReasoningPanel(text: String, thinking: Boolean) {
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun InputBar(
-    pendingImages: List<PendingImage>,
+    pendingAttachments: List<PendingAttachment>,
     isLoading: Boolean,
-    onPickImage: (Uri) -> Unit,
-    onRemoveImage: (PendingImage) -> Unit,
+    onPickAttachment: (Uri) -> Unit,
+    onRemoveAttachment: (PendingAttachment) -> Unit,
     onSend: (String) -> Unit,
     onStop: () -> Unit
 ) {
@@ -1005,16 +1131,17 @@ fun InputBar(
     val focusRequester = remember { FocusRequester() }
     val focusManager = LocalFocusManager.current   // 发送后回收软键盘用
 
-    val maxImages = 9                    // 最多可添加的图片数
-    val tileSize = 54.dp                 // 缩略图 / "+" 格子的尺寸
+    val maxAttachments = 9               // 最多可添加的附件数
+    val tileSize = 54.dp                 // 缩略图 / 文件卡片 格子的尺寸
 
+    // 使用通用文件选择器：不仅图片，xlsx / docx / pdf 等任意文件都可选择上传
     val picker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickVisualMedia()
-    ) { uri -> uri?.let(onPickImage) }
+        ActivityResultContracts.GetContent()
+    ) { uri -> uri?.let(onPickAttachment) }
 
-    // 有图片正在上传时禁用发送，避免把尚未拿到访问地址的图片发出去
-    val uploading = pendingImages.any { it.uploading }
-    val canSend = !isLoading && !uploading && (text.text.isNotBlank() || pendingImages.isNotEmpty())
+    // 有附件正在上传时禁用发送，避免把尚未拿到访问地址的附件发出去
+    val uploading = pendingAttachments.any { it.uploading }
+    val canSend = !isLoading && !uploading && (text.text.isNotBlank() || pendingAttachments.isNotEmpty())
 
     fun doSend() {
         if (canSend) {
@@ -1025,9 +1152,8 @@ fun InputBar(
     }
 
     fun launchPicker() {
-        picker.launch(
-            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
-        )
+        // "*/*" 表示允许选择任意类型文件（图片 / 表格 / 文档 等）
+        picker.launch("*/*")
     }
 
     // ---- 聚焦时的动画过渡：背景变亮、边框变亮变粗（hover 效果）----
@@ -1061,7 +1187,7 @@ fun InputBar(
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
 
-                    // ---- 1) 图片预览 + "+" 添加格（流式换行）----
+                    // ---- 1) 附件预览（图片缩略图 / 文件卡片）+ "+" 添加格（流式换行）----
                     FlowRow(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1069,54 +1195,118 @@ fun InputBar(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        // 已选图片缩略图
-                        pendingImages.forEach { img ->
-                            Box(modifier = Modifier.size(tileSize)) {
-                                AsyncImage(
-                                    model = img.uri,
-                                    contentDescription = null,
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .clip(RoundedCornerShape(10.dp))
-                                )
-                                // 上传中 / 失败 时的半透明遮罩提示
-                                if (img.uploading || img.failed) {
-                                    Surface(
-                                        color = Color.Black.copy(alpha = 0.5f),
-                                        shape = RoundedCornerShape(10.dp),
-                                        modifier = Modifier.fillMaxSize()
-                                    ) {
-                                        Box(contentAlignment = Alignment.Center) {
-                                            Text(
-                                                text = if (img.uploading) "上传中" else "失败",
-                                                color = Color.White,
-                                                style = MaterialTheme.typography.labelSmall
-                                            )
+                        // 已选附件：图片显示缩略图，其它文件显示文件卡片
+                        pendingAttachments.forEach { att ->
+                            if (att.isImage) {
+                                Box(modifier = Modifier.size(tileSize)) {
+                                    AsyncImage(
+                                        model = att.uri,
+                                        contentDescription = null,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .clip(RoundedCornerShape(10.dp))
+                                    )
+                                    // 上传中 / 失败 时的半透明遮罩提示
+                                    if (att.uploading || att.failed) {
+                                        Surface(
+                                            color = Color.Black.copy(alpha = 0.5f),
+                                            shape = RoundedCornerShape(10.dp),
+                                            modifier = Modifier.fillMaxSize()
+                                        ) {
+                                            Box(contentAlignment = Alignment.Center) {
+                                                Text(
+                                                    text = if (att.uploading) "上传中" else "失败",
+                                                    color = Color.White,
+                                                    style = MaterialTheme.typography.labelSmall
+                                                )
+                                            }
                                         }
                                     }
+                                    Surface(
+                                        color = Color.Black.copy(alpha = 0.55f),
+                                        shape = CircleShape,
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .padding(3.dp)
+                                            .size(20.dp)
+                                            .clickable { onRemoveAttachment(att) }
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Close,
+                                            contentDescription = "删除",
+                                            tint = Color.White,
+                                            modifier = Modifier.padding(3.dp)
+                                        )
+                                    }
                                 }
-                                Surface(
-                                    color = Color.Black.copy(alpha = 0.55f),
-                                    shape = CircleShape,
-                                    modifier = Modifier
-                                        .align(Alignment.TopEnd)
-                                        .padding(3.dp)
-                                        .size(20.dp)
-                                        .clickable { onRemoveImage(img) }
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Filled.Close,
-                                        contentDescription = "删除",
-                                        tint = Color.White,
-                                        modifier = Modifier.padding(3.dp)
-                                    )
+                            } else {
+                                // 文件卡片：图标 + 文件名 + 上传状态；右上角可删除
+                                Box {
+                                    Surface(
+                                        color = Color.White.copy(alpha = 0.06f),
+                                        border = BorderStroke(1.dp, ChatColors.InputBorder),
+                                        shape = RoundedCornerShape(10.dp),
+                                        modifier = Modifier
+                                            .width(160.dp)
+                                            .height(tileSize)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(start = 8.dp, end = 20.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.InsertDriveFile,
+                                                contentDescription = null,
+                                                tint = ChatColors.Accent,
+                                                modifier = Modifier.size(24.dp)
+                                            )
+                                            Spacer(Modifier.width(6.dp))
+                                            Column(modifier = Modifier.weight(1f)) {
+                                                Text(
+                                                    text = att.fileName.ifBlank { "文件" },
+                                                    color = ChatColors.TextPrimary,
+                                                    style = MaterialTheme.typography.labelMedium,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                                Text(
+                                                    text = when {
+                                                        att.uploading -> "上传中…"
+                                                        att.failed -> "上传失败"
+                                                        else -> FileTypes.labelOf(att.fileName)
+                                                    },
+                                                    color = if (att.failed) Color(0xFFFFB3B3)
+                                                    else ChatColors.TextSecondary,
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    maxLines = 1,
+                                                    overflow = TextOverflow.Ellipsis
+                                                )
+                                            }
+                                        }
+                                    }
+                                    Surface(
+                                        color = Color.Black.copy(alpha = 0.55f),
+                                        shape = CircleShape,
+                                        modifier = Modifier
+                                            .align(Alignment.TopEnd)
+                                            .padding(3.dp)
+                                            .size(20.dp)
+                                            .clickable { onRemoveAttachment(att) }
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Close,
+                                            contentDescription = "删除",
+                                            tint = Color.White,
+                                            modifier = Modifier.padding(3.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
 
-                        // "+" 添加格：排在所有缩略图之后；达到上限则隐藏
-                        if (pendingImages.size < maxImages) {
+                        // "+" 添加格：排在所有附件之后；达到上限则隐藏
+                        if (pendingAttachments.size < maxAttachments) {
                             // "+" 添加按钮：与发送按钮同样大小的小圆钮
                             Surface(
                                 shape = CircleShape,
@@ -1129,7 +1319,7 @@ fun InputBar(
                                 Box(contentAlignment = Alignment.Center) {
                                     Icon(
                                         imageVector = Icons.Filled.Add,
-                                        contentDescription = "添加图片",
+                                        contentDescription = "添加附件",
                                         tint = ChatColors.TextSecondary,
                                         modifier = Modifier.size(20.dp)
                                     )
@@ -1180,9 +1370,9 @@ fun InputBar(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         // 图片计数提示（可选）
-                        if (pendingImages.isNotEmpty()) {
+                        if (pendingAttachments.isNotEmpty()) {
                             Text(
-                                text = "${pendingImages.size}/$maxImages",
+                                text = "${pendingAttachments.size}/$maxAttachments",
                                 color = ChatColors.TextSecondary,
                                 style = MaterialTheme.typography.bodySmall
                             )

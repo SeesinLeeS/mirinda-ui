@@ -19,17 +19,20 @@ import java.util.UUID
  *
  * 它持有：
  *  - messages：当前对话的消息列表（UI 观察它，变了就自动刷新）
- *  - pendingImages：当前"待发送"的图片（显示在输入框上方的预览区）
+ *  - pendingAttachments：当前"待发送"的附件（图片/文件，显示在输入框上方的预览区）
  *  - availableModels / selectedModel：可选模型与当前选中的模型
  *  - conversations / currentConversationId：对话历史列表与当前所在对话
  *
  * sendMessage() 已接入后端 /agent/send（流式 SSE）。
  */
 /**
- * 待发送图片：选图后立即上传，[fileUrl] 为上传成功后后端返回的访问地址。
+ * 待发送附件：选择后立即上传，[fileUrl] 为上传成功后后端返回的访问地址。
+ * 附件可以是图片，也可以是 xlsx / docx / pdf 等普通文件，由 [isImage] 区分展示。
  */
-data class PendingImage(
+data class PendingAttachment(
     val uri: Uri,
+    val fileName: String,          // 文件名（含后缀），用于类型判断与预览展示
+    val isImage: Boolean,          // 是否图片：决定预览用缩略图还是文件卡片
     val fileUrl: String? = null,   // 上传成功后的访问 URL；未上传完/失败为 null
     val uploading: Boolean = false,
     val failed: Boolean = false
@@ -42,8 +45,9 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     // mutableStateListOf：一个"可被 Compose 观察"的列表，增删会自动触发 UI 刷新
     val messages = mutableStateListOf<ChatMessage>()
 
-    // 待发送的图片（输入框上方预览区的数据源）：选图后立即上传，fileUrl 为访问地址
-    val pendingImages = mutableStateListOf<PendingImage>()
+    // 待发送的附件（输入框上方预览区的数据源）：选择后立即上传，fileUrl 为访问地址。
+    // 既可以是图片，也可以是 xlsx / docx / pdf 等普通文件。
+    val pendingAttachments = mutableStateListOf<PendingAttachment>()
 
     // 是否正在等待回复（控制发送按钮：loading 时变为"终止"按钮）
     val isLoading = mutableStateOf(false)
@@ -454,7 +458,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         saveMessagesToCurrent()          // 先存好当前对话
         currentConversationId.value = id
         syncMessagesFromCurrent()        // 再加载目标对话（内存里的）
-        pendingImages.clear()
+        pendingAttachments.clear()
         // 恢复该会话的“是否还有更早”标记（已加载过的会话直接用缓存）
         hasMoreHistory.value = historyHasMore[id] ?: false
         requestScrollToBottom()          // 进入会话：先按内存内容定位到底部
@@ -591,8 +595,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             } else {
                 // 用户消息：先结算上一条助手气泡，再加用户气泡
                 flushAssistant()
+                // 上传的附件：message_type 为 image / file 时 part 是一个访问链接，
+                // 根据链接里的文件名后缀判断是图片还是普通文件，决定如何展示。
                 val blocks = when (b.messageType) {
-                    "image" -> listOf(ContentBlock.Image(remoteUrl = b.part))
+                    "image", "file" -> {
+                        val name = FileTypes.fileNameFromUrl(b.part)
+                        if (b.messageType == "image" || FileTypes.isImageName(name)) {
+                            listOf(ContentBlock.Image(remoteUrl = b.part, fileName = name))
+                        } else {
+                            listOf(ContentBlock.File(remoteUrl = b.part, fileName = name))
+                        }
+                    }
                     else -> listOf(ContentBlock.Text(b.part))
                 }
                 result.add(ChatMessage(id = "srv-u-${b.id}", role = Role.USER, blocks = blocks))
@@ -611,7 +624,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         conversations.add(0, conv)       // 新草稿永远在列表最上面
         currentConversationId.value = conv.id
         conversationMessages[conv.id] = freshConversationMessages()
-        pendingImages.clear()
+        pendingAttachments.clear()
         hasMoreHistory.value = false     // 新对话没有更早历史
         syncMessagesFromCurrent()
         requestScrollToBottom()
@@ -653,7 +666,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 hasMoreHistory.value = false
                 syncMessagesFromCurrent()
             }
-            pendingImages.clear()
+            pendingAttachments.clear()
         }
     }
 
@@ -672,35 +685,39 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     // ===================================================================
-    //  图片
+    //  附件（图片 / 文件）
     // ===================================================================
 
     /**
-     * 添加一张待发送图片：选图后立即上传到后端 OBS，
-     * 上传成功后把访问 URL 写回 [pendingImages]，发送时直接拼进 files。
+     * 添加一个待发送附件（图片或普通文件）：选择后立即上传到后端 OBS，
+     * 上传成功后把访问 URL 写回 [pendingAttachments]，发送时直接拼进 files。
+     * 先按文件名后缀判定是否图片，用于预览区的缩略图 / 文件卡片两种展示。
      */
-    fun addPendingImage(uri: Uri) {
-        val item = PendingImage(uri = uri, uploading = true)
-        pendingImages.add(item)
+    fun addPendingAttachment(uri: Uri) {
+        val ctx = getApplication<Application>()
+        val name = ChatApi.displayNameOf(uri, ctx)
+        val isImage = FileTypes.isImageName(name)
+        val item = PendingAttachment(uri = uri, fileName = name, isImage = isImage, uploading = true)
+        pendingAttachments.add(item)
         viewModelScope.launch {
             try {
-                val key = ChatApi.uploadFile(uri, getApplication<Application>())
+                val key = ChatApi.uploadFile(uri, ctx)
                 val url = ChatApi.fileUrl(key)
-                val idx = pendingImages.indexOfFirst { it.uri == uri }
+                val idx = pendingAttachments.indexOfFirst { it.uri == uri }
                 if (idx >= 0) {
-                    pendingImages[idx] = pendingImages[idx].copy(fileUrl = url, uploading = false)
+                    pendingAttachments[idx] = pendingAttachments[idx].copy(fileUrl = url, uploading = false)
                 }
             } catch (e: Exception) {
-                val idx = pendingImages.indexOfFirst { it.uri == uri }
+                val idx = pendingAttachments.indexOfFirst { it.uri == uri }
                 if (idx >= 0) {
-                    pendingImages[idx] = pendingImages[idx].copy(uploading = false, failed = true)
+                    pendingAttachments[idx] = pendingAttachments[idx].copy(uploading = false, failed = true)
                 }
             }
         }
     }
 
-    fun removePendingImage(target: PendingImage) {
-        pendingImages.removeAll { it.uri == target.uri }
+    fun removePendingAttachment(target: PendingAttachment) {
+        pendingAttachments.removeAll { it.uri == target.uri }
     }
 
     // ===================================================================
@@ -720,15 +737,21 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * 因此图片只在本地气泡里预览。
      */
     fun sendMessage(text: String) {
-        if (text.isBlank() && pendingImages.isEmpty()) return
+        if (text.isBlank() && pendingAttachments.isEmpty()) return
         if (isLoading.value) return  // 正在请求时不重复发送
 
         // ---- 组装用户消息：先放文字（若有），再放所有图片 ----
         // 图片在选图时已上传，这里本地预览用 localUri，发送用的访问地址用 remoteUrl。
         val blocks = mutableListOf<ContentBlock>()
         if (text.isNotBlank()) blocks.add(ContentBlock.Text(text))
-        pendingImages.forEach {
-            blocks.add(ContentBlock.Image(localUri = it.uri, remoteUrl = it.fileUrl))
+        // 每个附件单独成块：图片 -> Image 块，其它文件 -> File 块；
+        // UI 会把它们分别渲染成独立气泡，与文字内容分离。
+        pendingAttachments.forEach {
+            if (it.isImage) {
+                blocks.add(ContentBlock.Image(localUri = it.uri, remoteUrl = it.fileUrl, fileName = it.fileName))
+            } else {
+                blocks.add(ContentBlock.File(localUri = it.uri, remoteUrl = it.fileUrl, fileName = it.fileName))
+            }
         }
 
         val userId = newId()
@@ -738,8 +761,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         maybeUpdateTitle(text)
 
         // 收集已上传成功的访问地址（选图时已上传完），作为本次发送的 files
-        val files = pendingImages.mapNotNull { it.fileUrl }
-        pendingImages.clear()
+        val files = pendingAttachments.mapNotNull { it.fileUrl }
+        pendingAttachments.clear()
 
         startStreaming(userId, text, files)
     }
@@ -758,10 +781,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             .filterIsInstance<ContentBlock.Text>()
             .joinToString("\n") { it.text }
             .trim()
-        // 取出该气泡里图片已上传的访问地址（发送时已存进 remoteUrl）
-        val files = userMsg.blocks
-            .filterIsInstance<ContentBlock.Image>()
-            .mapNotNull { it.remoteUrl }
+        // 取出该消息里附件（图片 + 文件）已上传的访问地址（发送时已存进 remoteUrl）
+        val files = userMsg.blocks.mapNotNull { b ->
+            when (b) {
+                is ContentBlock.Image -> b.remoteUrl
+                is ContentBlock.File -> b.remoteUrl
+                else -> null
+            }
+        }
         if (text.isBlank() && files.isEmpty()) return
         // 清除失败标记
         messages[idx] = userMsg.copy(failed = false)
@@ -815,7 +842,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         val hasContent = a.blocks.any { b ->
                             (b is ContentBlock.Text && b.text.isNotBlank()) ||
                             (b is ContentBlock.Reasoning && b.text.isNotBlank()) ||
-                            b is ContentBlock.Image
+                            b is ContentBlock.Image || b is ContentBlock.File
                         }
                         if (!hasContent) messages.removeAt(aIdx)
                     }
