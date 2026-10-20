@@ -31,6 +31,11 @@ object AppColors {
     val ReasoningBorder = Color(0xFF2E4D80) // 思考面板边框
     val ReasoningText = Color(0xFFB9C9E6)   // 思考正文：柔和灰蓝
 
+    // ---- 工具调用提示气泡 ----
+    val ToolCallBg = Color(0xFF123A3A)      // 工具调用气泡背景：带青绿的深色，区别于思考面板
+    val ToolCallBorder = Color(0xFF2C6E6B)  // 工具调用气泡边框：青绿
+    val ToolCallText = Color(0xFF9FE0D6)    // 工具调用文字：柔和青绿
+
     // ---- 状态 ----
     val Error = Color(0xFFE57373)           // 错误：柔和红
     val Success = Color(0xFF4CAF50)         // 成功：绿

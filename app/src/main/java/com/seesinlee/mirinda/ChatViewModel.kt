@@ -560,18 +560,22 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val result = mutableListOf<ChatMessage>()
         var reasoning = StringBuilder()
         var content = StringBuilder()
+        var toolCalls = mutableListOf<String>()
         var hasAssistant = false
         var groupId: String? = null
 
         fun flushAssistant() {
             if (!hasAssistant) return
+            // 块顺序与流式一致：思考 -> 工具调用提示 -> 正文回复
             val blocks = buildList {
                 if (reasoning.isNotEmpty()) add(ContentBlock.Reasoning(reasoning.toString()))
+                toolCalls.forEach { if (it.isNotBlank()) add(ContentBlock.ToolCall(it)) }
                 if (content.isNotEmpty()) add(ContentBlock.Text(content.toString()))
             }.ifEmpty { listOf(ContentBlock.Text("")) }
             result.add(ChatMessage(id = "srv-a-${groupId ?: newId()}", role = Role.ASSISTANT, blocks = blocks))
             reasoning = StringBuilder()
             content = StringBuilder()
+            toolCalls = mutableListOf()
             hasAssistant = false
             groupId = null
         }
@@ -584,6 +588,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         if (content.isNotEmpty()) flushAssistant()
                         if (groupId == null) groupId = b.id
                         if (b.part.isNotEmpty()) reasoning.append(b.part)
+                        hasAssistant = true
+                    }
+                    "tool_call" -> {   // 工具调用提示：单独成一个气泡
+                        if (groupId == null) groupId = b.id
+                        if (b.part.isNotBlank()) toolCalls.add(b.part.trim())
                         hasAssistant = true
                     }
                     else -> {   // token / image / 其它都并入正文
@@ -820,6 +829,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         // ---- 发起流式请求 ----
         val reasoning = StringBuilder()
         val content = StringBuilder()
+        // 工具调用提示：每收到一个 tool_call 事件追加一条，渲染成独立气泡
+        val toolCalls = mutableListOf<String>()
 
         // 当前会话的后端 id：新对话为空 -> 传 0，后端新建并在 meta 事件回传真实 id
         val currentServerId = conversations
@@ -842,6 +853,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         val hasContent = a.blocks.any { b ->
                             (b is ContentBlock.Text && b.text.isNotBlank()) ||
                             (b is ContentBlock.Reasoning && b.text.isNotBlank()) ||
+                            (b is ContentBlock.ToolCall && b.text.isNotBlank()) ||
                             b is ContentBlock.Image || b is ContentBlock.File
                         }
                         if (!hasContent) messages.removeAt(aIdx)
@@ -864,11 +876,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         is ChatApi.StreamEvent.Reasoning -> {
                             reasoning.append(ev.delta)
-                            updateAssistant(assistantId, reasoning.toString(), content.toString(), streaming = true)
+                            updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), streaming = true)
+                        }
+                        is ChatApi.StreamEvent.ToolCall -> {
+                            // 工具调用提示：每个事件追加一条，作为一个独立气泡
+                            val info = ev.info.trim()
+                            if (info.isNotEmpty()) toolCalls.add(info)
+                            updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), streaming = true)
                         }
                         is ChatApi.StreamEvent.Token -> {
                             content.append(ev.delta)
-                            updateAssistant(assistantId, reasoning.toString(), content.toString(), streaming = true)
+                            updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), streaming = true)
                         }
                     }
                 }
@@ -901,12 +919,20 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      * 这样就实现了"先思考、再回复"：思考阶段只有 Reasoning 块，
      * 正文一开始出现，Reasoning 面板会自动折叠（由 UI 根据 isStreaming 控制）。
      */
-    private fun updateAssistant(id: String, reasoning: String, content: String, streaming: Boolean) {
+    private fun updateAssistant(
+        id: String,
+        reasoning: String,
+        toolCalls: List<String>,
+        content: String,
+        streaming: Boolean
+    ) {
         val idx = messages.indexOfFirst { it.id == id }
         if (idx < 0) return
 
+        // 块顺序：思考 -> 工具调用提示（可多个）-> 正文回复
         val blocks = buildList {
             if (reasoning.isNotEmpty()) add(ContentBlock.Reasoning(reasoning))
+            toolCalls.forEach { if (it.isNotBlank()) add(ContentBlock.ToolCall(it)) }
             if (content.isNotEmpty()) add(ContentBlock.Text(content))
         }.ifEmpty { listOf(ContentBlock.Text("")) }
 

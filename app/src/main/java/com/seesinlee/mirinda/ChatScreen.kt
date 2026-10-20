@@ -112,6 +112,7 @@ private fun stripInterruptions(blocks: List<ContentBlock>): StrippedBlocks {
             }
             is ContentBlock.Image -> out.add(block)
             is ContentBlock.File -> out.add(block)
+            is ContentBlock.ToolCall -> out.add(block)
         }
     }
     return StrippedBlocks(out, interrupts)
@@ -140,6 +141,10 @@ object ChatColors {
     val ReasoningBg = AppColors.ReasoningBg
     val ReasoningBorder = AppColors.ReasoningBorder
     val ReasoningText = AppColors.ReasoningText
+
+    val ToolCallBg = AppColors.ToolCallBg
+    val ToolCallBorder = AppColors.ToolCallBorder
+    val ToolCallText = AppColors.ToolCallText
 }
 
 
@@ -807,7 +812,13 @@ fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
                 )
                 Spacer(Modifier.height(8.dp))
             }
-            otherBlocks.forEach { block -> MessageBlock(block, ChatColors.TextPrimary) }
+            // 工具调用气泡与"深度思考"一样可折叠：仍在流式且是最后一个块时视为"调用中"（展开），
+            // 一旦后面出现新块（下一个工具调用 / 正文）或流式结束，则收起成一行"工具调用"。
+            val lastOtherIndex = otherBlocks.lastIndex
+            otherBlocks.forEachIndexed { index, block ->
+                val toolActive = msg.isStreaming && index == lastOtherIndex
+                MessageBlock(block, ChatColors.TextPrimary, toolActive)
+            }
 
             // 中断标记气泡：左对齐小气泡，风格与"深度思考"面板一致
             stripped.interruptions.forEach { label ->
@@ -821,7 +832,11 @@ fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
 
 /** 消息内的单个内容块（文字 / 图片 / 文件），气泡内外通用 */
 @Composable
-private fun MessageBlock(block: ContentBlock, textColor: Color = Color.Unspecified) {
+private fun MessageBlock(
+    block: ContentBlock,
+    textColor: Color = Color.Unspecified,
+    toolActive: Boolean = false
+) {
     when (block) {
         is ContentBlock.Text -> {
             // 用轻量 Markdown 渲染器解析（粗体/代码块/列表/标题/链接等）
@@ -836,6 +851,7 @@ private fun MessageBlock(block: ContentBlock, textColor: Color = Color.Unspecifi
         }
         is ContentBlock.Image -> ImageBubble(block)
         is ContentBlock.File -> FileBubble(block)
+        is ContentBlock.ToolCall -> ToolCallBubble(block.text, active = toolActive)
     }
 }
 
@@ -893,6 +909,7 @@ private fun UserBlockBubble(block: ContentBlock) {
         is ContentBlock.Image -> ImageBubble(block)
         is ContentBlock.File -> FileBubble(block)
         is ContentBlock.Reasoning -> { /* 用户消息不含推理块，忽略 */ }
+        is ContentBlock.ToolCall -> { /* 用户消息不含工具调用块，忽略 */ }
     }
 }
 
@@ -985,6 +1002,86 @@ private fun FileBubble(block: ContentBlock.File) {
  * 中断标记气泡：当 agent 文本/思考结尾带有 "\n\n（xxx中断）" 时，
  * 抽取括号内容，用与整体 UI 一致的小气泡单独展示（左对齐，呼应助手消息）。
  */
+/**
+ * 工具调用提示气泡：交互与"深度思考"面板一致，可折叠。
+ *
+ * - active=true（工具正在调用、后面还没有新内容）：默认展开，标题显示"工具调用中…"并带转圈动效。
+ * - active=false（调用结束 / 历史消息）：自动折叠成一行"🔧 工具调用"，点一下可展开回看详情。
+ *
+ * text 为后端 tool_call 事件的提示内容（当前是一个字符串，原样展示）。
+ */
+@Composable
+private fun ToolCallBubble(text: String, active: Boolean) {
+    val detail = text.trim().ifEmpty { "正在调用工具…" }
+    // 展开状态：调用中默认展开；结束/历史默认折叠（仍可手动点开）。
+    var expanded by remember { mutableStateOf(active) }
+    LaunchedEffect(active) { expanded = active }
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Start
+    ) {
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = ChatColors.ToolCallBg,
+            border = BorderStroke(1.dp, ChatColors.ToolCallBorder),
+            modifier = Modifier.widthIn(max = 300.dp)
+        ) {
+            Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+                // ---- 标题行（可点击折叠/展开）----
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { expanded = !expanded },
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (active) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(14.dp),
+                            strokeWidth = 2.dp,
+                            color = ChatColors.Accent
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            "工具调用中…",
+                            color = ChatColors.ToolCallText,
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    } else {
+                        Text("\uD83D\uDD27", style = MaterialTheme.typography.labelLarge)  // 🔧
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            "工具调用",
+                            color = ChatColors.ToolCallText,
+                            style = MaterialTheme.typography.labelLarge
+                        )
+                    }
+                    Spacer(Modifier.weight(1f))
+                    Icon(
+                        imageVector = if (expanded) Icons.Filled.KeyboardArrowUp
+                        else Icons.Filled.KeyboardArrowDown,
+                        contentDescription = if (expanded) "收起" else "展开",
+                        tint = ChatColors.TextSecondary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+
+                // ---- 工具调用详情（可折叠）----
+                AnimatedVisibility(visible = expanded) {
+                    Column {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = detail,
+                            color = ChatColors.ToolCallText,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 @Composable
 private fun InterruptionBubble(label: String) {
     Row(

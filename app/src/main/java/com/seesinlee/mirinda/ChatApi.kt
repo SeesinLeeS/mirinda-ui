@@ -28,6 +28,9 @@ import java.net.URL
  *   event:token
  *   data:正式回复的文字
  *   <空行>
+ *   event:tool_call
+ *   data:工具调用提示（工具名 / 说明 / JSON）
+ *   <空行>
  */
 object ChatApi {
 
@@ -46,6 +49,8 @@ object ChatApi {
     sealed class StreamEvent {
         data class Reasoning(val delta: String) : StreamEvent()  // 推理内容增量
         data class Token(val delta: String) : StreamEvent()      // 正文内容增量
+        /** 工具调用提示：后端发起某个工具调用时推送，info 为提示内容（工具名/说明/JSON 等） */
+        data class ToolCall(val info: String) : StreamEvent()
         /** 流最开始的元信息：带后端会话 id（新对话此时才产生）和标题 */
         data class Meta(val conversationId: String, val title: String) : StreamEvent()
     }
@@ -475,6 +480,8 @@ object ChatApi {
                                 // CancellationException，从而跳到 finally 断开连接。
                                 "reasoning" -> emit(StreamEvent.Reasoning(data))
                                 "token"     -> emit(StreamEvent.Token(data))
+                                // 工具调用提示：原样把 data 作为提示内容发出，UI 单独做一个气泡展示
+                                "tool_call" -> emit(StreamEvent.ToolCall(data))
                                 "meta"      -> {
                                     // data: {"conversation_id":7,"title":"..."}
                                     runCatching {

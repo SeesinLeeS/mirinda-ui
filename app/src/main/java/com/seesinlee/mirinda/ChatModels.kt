@@ -49,6 +49,13 @@ sealed class ContentBlock {
         val remoteUrl: String? = null,
         val fileName: String = ""
     ) : ContentBlock()
+
+    /**
+     * 工具调用提示块（对应后端的 tool_call 事件）。
+     * 单独成一个气泡，用来提示"助手正在调用某个工具"。
+     * text: 后端在 tool_call 事件里给的提示内容（工具名 / 说明文字 / JSON 等，原样保存）。
+     */
+    data class ToolCall(val text: String) : ContentBlock()
 }
 
 /**
