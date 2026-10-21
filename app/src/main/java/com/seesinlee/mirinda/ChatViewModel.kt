@@ -592,7 +592,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     "tool_call" -> {   // 工具调用提示：单独成一个气泡
                         if (groupId == null) groupId = b.id
-                        if (b.part.isNotBlank()) toolCalls.add(b.part.trim())
+                        if (isValidToolCallPayload(b.part)) toolCalls.add(b.part.trim())
                         hasAssistant = true
                     }
                     else -> {   // token / image / 其它都并入正文
@@ -879,9 +879,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), streaming = true)
                         }
                         is ChatApi.StreamEvent.ToolCall -> {
-                            // 工具调用提示：每个事件追加一条，作为一个独立气泡
+                            // 工具调用提示：每个事件追加一条，作为一个独立气泡。
+                            // 过滤后端噪声事件（空内容 / 字面量 "null" / 空数组 "[]"），
+                            // 否则会被当成一条有效调用渲染成多余气泡（内容显示 null）。
                             val info = ev.info.trim()
-                            if (info.isNotEmpty()) toolCalls.add(info)
+                            if (isValidToolCallPayload(info)) toolCalls.add(info)
                             updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), streaming = true)
                         }
                         is ChatApi.StreamEvent.Token -> {
@@ -909,6 +911,16 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             messages[idx] = messages[idx].copy(isStreaming = false)
         }
         saveMessagesToCurrent()
+    }
+
+    /**
+     * 判断 tool_call 事件的内容是否值得渲染成独立气泡。
+     * 后端在"工具调用开始/结束"时常会附带噪声事件（空内容、字面量 "null"、空数组 "[]"），
+     * 这类内容若直接进列表会被当成一条有效工具调用，渲染出多余的气泡（内容显示 null）。
+     */
+    private fun isValidToolCallPayload(info: String): Boolean {
+        val t = info.trim()
+        return t.isNotEmpty() && !t.equals("null", ignoreCase = true) && t != "[]"
     }
 
     /**

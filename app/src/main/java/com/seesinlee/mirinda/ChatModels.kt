@@ -53,7 +53,9 @@ sealed class ContentBlock {
     /**
      * 工具调用提示块（对应后端的 tool_call 事件）。
      * 单独成一个气泡，用来提示"助手正在调用某个工具"。
-     * text: 后端在 tool_call 事件里给的提示内容（工具名 / 说明文字 / JSON 等，原样保存）。
+     * text: 后端在 tool_call 事件里给的提示内容。优先为 `ToolInfo` 列表的 JSON
+     *      （`[{"name":"...","type":"..."}]`，可能一次推送多个或单个对象），UI 会解析成
+     *       「工具名 + 类型标签」逐条展示；解析失败时回退原样展示文本。
      */
     data class ToolCall(val text: String) : ContentBlock()
 }

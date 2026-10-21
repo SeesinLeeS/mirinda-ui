@@ -33,6 +33,11 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
+import android.content.Intent
+import org.json.JSONArray
+import org.json.JSONObject
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Stop
@@ -177,13 +182,18 @@ fun ChatScreen(vm: ChatViewModel) {
 
     // 流式输出时的"自动滚到底"：
     // 不能只监听 messages.size（流式是往同一条消息里追加内容，size 不变），
-    // 这里额外用最后一条消息的"文本总长度"作为变化信号。
+    // 这里用最后一条消息的"内容总长度"作为变化信号。
+    // 注意：必须包含所有块类型（含 ToolCall / Image / File），否则在"工具调用"等
+    // 非文本阶段增长时签名不变，视图不会跟随到底部。
     val lastContentSignature = vm.messages.lastOrNull()?.let { m ->
         m.blocks.sumOf { b ->
             when (b) {
                 is ContentBlock.Text -> b.text.length
                 is ContentBlock.Reasoning -> b.text.length
-                else -> 0
+                is ContentBlock.ToolCall -> b.text.length
+                // 图片/文件出现即视为一次变化，给个非零权重
+                is ContentBlock.Image -> 1
+                is ContentBlock.File -> 1
             }
         }
     } ?: 0
@@ -818,6 +828,8 @@ fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
             otherBlocks.forEachIndexed { index, block ->
                 val toolActive = msg.isStreaming && index == lastOtherIndex
                 MessageBlock(block, ChatColors.TextPrimary, toolActive)
+                // 块间距与"深度思考"面板一致（8.dp），避免工具气泡紧贴正文内容
+                if (index != lastOtherIndex) Spacer(Modifier.height(8.dp))
             }
 
             // 中断标记气泡：左对齐小气泡，风格与"深度思考"面板一致
@@ -1008,10 +1020,45 @@ private fun FileBubble(block: ContentBlock.File) {
  * - active=true（工具正在调用、后面还没有新内容）：默认展开，标题显示"工具调用中…"并带转圈动效。
  * - active=false（调用结束 / 历史消息）：自动折叠成一行"🔧 工具调用"，点一下可展开回看详情。
  *
- * text 为后端 tool_call 事件的提示内容（当前是一个字符串，原样展示）。
+ * text 为后端 tool_call 事件的提示内容。优化后优先按 `ToolInfo` 列表（[{"name","type"}]）解析，
+ * 折叠态标题直接带上工具名，展开态逐条展示工具名 + 类型标签；解析失败时回退原样展示文本。
  */
+
+/** 后端 tool_call 消息体里的单个工具信息 */
+private data class ToolInfo(val name: String, val type: String)
+
+/**
+ * 把 tool_call 的提示内容解析成 [ToolInfo] 列表。
+ * 兼容两种形态：JSON 数组 `[{...}]`（一次推送多个工具）或单个 JSON 对象 `{...}`（一次一个工具）。
+ * 无法解析（非 JSON / 字段缺失）时返回 null，调用方回退原样展示。
+ */
+private fun parseToolInfos(raw: String): List<ToolInfo>? {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return null
+    return runCatching {
+        val list = mutableListOf<ToolInfo>()
+        when {
+            trimmed.startsWith("[") -> {
+                val arr = JSONArray(trimmed)
+                for (i in 0 until arr.length()) {
+                    arr.optJSONObject(i)?.let { o ->
+                        list.add(ToolInfo(o.optString("name"), o.optString("type")))
+                    }
+                }
+            }
+            trimmed.startsWith("{") -> {
+                val o = JSONObject(trimmed)
+                list.add(ToolInfo(o.optString("name"), o.optString("type")))
+            }
+            else -> return null
+        }
+        list.ifEmpty { null }
+    }.getOrNull()
+}
+
 @Composable
 private fun ToolCallBubble(text: String, active: Boolean) {
+    val tools = parseToolInfos(text)
     val detail = text.trim().ifEmpty { "正在调用工具…" }
     // 展开状态：调用中默认展开；结束/历史默认折叠（仍可手动点开）。
     var expanded by remember { mutableStateOf(active) }
@@ -1048,6 +1095,7 @@ private fun ToolCallBubble(text: String, active: Boolean) {
                             style = MaterialTheme.typography.labelLarge
                         )
                     } else {
+                        // 折叠态：只显示"工具调用"，不暴露工具名称（名称在展开后查看）
                         Text("\uD83D\uDD27", style = MaterialTheme.typography.labelLarge)  // 🔧
                         Spacer(Modifier.width(6.dp))
                         Text(
@@ -1070,13 +1118,85 @@ private fun ToolCallBubble(text: String, active: Boolean) {
                 AnimatedVisibility(visible = expanded) {
                     Column {
                         Spacer(Modifier.height(8.dp))
-                        Text(
-                            text = detail,
-                            color = ChatColors.ToolCallText,
-                            style = MaterialTheme.typography.bodySmall
-                        )
+                        if (tools != null) {
+                            // 已按 ToolInfo 列表解析：逐条展示「工具名 + 类型标签」
+                            tools.forEachIndexed { i, tool ->
+                                ToolInfoRow(tool)
+                                if (i != tools.lastIndex) Spacer(Modifier.height(6.dp))
+                            }
+                        } else {
+                            // 回退：原样展示后端文本
+                            Text(
+                                text = detail,
+                                color = ChatColors.ToolCallText,
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
                     }
                 }
+            }
+        }
+    }
+}
+
+/**
+ * 判断工具是否应渲染为可点击链接：
+ *  - type 属于链接类（url/link/web…），或
+ *  - name 本身就是一个网址（http(s):// 开头，或形如 example.com 的裸域名）。
+ * 内容（工具名/网址）始终放在 name 中，故链接地址取 name。
+ */
+private fun isLinkTool(tool: ToolInfo): Boolean {
+    if (tool.type.trim().lowercase() in setOf("url", "link", "href", "web", "website")) return true
+    val n = tool.name.trim()
+    if (n.startsWith("http://", ignoreCase = true) || n.startsWith("https://", ignoreCase = true)) return true
+    // 裸域名（如 example.com）也按链接处理
+    return n.contains(".") && !n.contains(" ") && android.util.Patterns.WEB_URL.matcher(n).matches()
+}
+
+/** 用系统浏览器打开链接；name 视为地址，缺失协议时补 https:// */
+private fun openToolLink(context: android.content.Context, raw: String) {
+    val url = raw.trim()
+    if (url.isBlank()) return
+    val fixed = if (url.startsWith("http://") || url.startsWith("https://")) url else "https://$url"
+    runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(fixed))) }
+}
+
+/**
+ * 工具信息单行：
+ *  - 普通类型：工具名（加粗）+ 类型标签（圆角小药丸）
+ *  - 链接类型（url/link/web…）：工具名渲染成可点击链接（主题色 + 下划线），点按用浏览器打开
+ */
+@Composable
+private fun ToolInfoRow(tool: ToolInfo) {
+    val context = LocalContext.current
+    val linkType = isLinkTool(tool)
+    val label = tool.name.ifBlank { "未命名工具" }
+
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = if (linkType) Modifier.clickable { openToolLink(context, label) } else Modifier
+    ) {
+        Text(
+            text = label,
+            color = if (linkType) ChatColors.Accent else ChatColors.ToolCallText,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.Medium,
+            textDecoration = if (linkType) TextDecoration.Underline else TextDecoration.None,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+        if (tool.type.isNotBlank()) {
+            Spacer(Modifier.width(6.dp))
+            Surface(
+                shape = RoundedCornerShape(6.dp),
+                color = ChatColors.ToolCallBorder.copy(alpha = 0.22f)
+            ) {
+                Text(
+                    text = tool.type,
+                    color = ChatColors.ToolCallText,
+                    style = MaterialTheme.typography.labelSmall,
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                )
             }
         }
     }

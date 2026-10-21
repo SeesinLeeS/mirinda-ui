@@ -37,7 +37,7 @@ object ChatApi {
     /**
      * 后端地址。
      */
-    private const val BASE_URL = "http://10.83.254.33:9090"
+    private const val BASE_URL = "http://192.168.3.34:9090"
 
     /**
      * 由后端返回的 OBS key 拼出可访问的文件 URL：`{BASE_URL}/file/{key}`。
