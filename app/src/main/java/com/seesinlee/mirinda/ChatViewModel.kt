@@ -561,21 +561,27 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         var reasoning = StringBuilder()
         var content = StringBuilder()
         var toolCalls = mutableListOf<String>()
+        // 文件气泡：本轮助手回复里的文件访问 URL（始终排在正文之后，与流式一致）
+        var assistantFiles = mutableListOf<String>()
         var hasAssistant = false
         var groupId: String? = null
 
         fun flushAssistant() {
             if (!hasAssistant) return
-            // 块顺序与流式一致：思考 -> 工具调用提示 -> 正文回复
+            // 块顺序与流式一致：思考 -> 工具调用提示 -> 正文回复 -> 文件气泡
             val blocks = buildList {
                 if (reasoning.isNotEmpty()) add(ContentBlock.Reasoning(reasoning.toString()))
                 toolCalls.forEach { if (it.isNotBlank()) add(ContentBlock.ToolCall(it)) }
                 if (content.isNotEmpty()) add(ContentBlock.Text(content.toString()))
+                assistantFiles.forEach { url ->
+                    if (url.isNotBlank()) add(ContentBlock.File(remoteUrl = url, fileName = FileTypes.fileNameFromUrl(url)))
+                }
             }.ifEmpty { listOf(ContentBlock.Text("")) }
             result.add(ChatMessage(id = "srv-a-${groupId ?: newId()}", role = Role.ASSISTANT, blocks = blocks))
             reasoning = StringBuilder()
             content = StringBuilder()
             toolCalls = mutableListOf()
+            assistantFiles = mutableListOf()
             hasAssistant = false
             groupId = null
         }
@@ -593,6 +599,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     "tool_call" -> {   // 工具调用提示：单独成一个气泡
                         if (groupId == null) groupId = b.id
                         if (isValidToolCallPayload(b.part)) toolCalls.add(b.part.trim())
+                        hasAssistant = true
+                    }
+                    "file" -> {   // 文件事件：单独成一个"文件气泡"，始终排在正文之后
+                        if (groupId == null) groupId = b.id
+                        if (b.part.isNotBlank()) assistantFiles.add(b.part)
                         hasAssistant = true
                     }
                     else -> {   // token / image / 其它都并入正文
@@ -831,6 +842,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val content = StringBuilder()
         // 工具调用提示：每收到一个 tool_call 事件追加一条，渲染成独立气泡
         val toolCalls = mutableListOf<String>()
+        // 文件事件：收到的文件访问 URL（渲染成独立"文件气泡"，始终排在正文之后）
+        val fileUrls = mutableListOf<String>()
 
         // 当前会话的后端 id：新对话为空 -> 传 0，后端新建并在 meta 事件回传真实 id
         val currentServerId = conversations
@@ -876,7 +889,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                         }
                         is ChatApi.StreamEvent.Reasoning -> {
                             reasoning.append(ev.delta)
-                            updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), streaming = true)
+                            updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), fileUrls, streaming = true)
                         }
                         is ChatApi.StreamEvent.ToolCall -> {
                             // 工具调用提示：每个事件追加一条，作为一个独立气泡。
@@ -884,11 +897,17 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             // 否则会被当成一条有效调用渲染成多余气泡（内容显示 null）。
                             val info = ev.info.trim()
                             if (isValidToolCallPayload(info)) toolCalls.add(info)
-                            updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), streaming = true)
+                            updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), fileUrls, streaming = true)
                         }
                         is ChatApi.StreamEvent.Token -> {
                             content.append(ev.delta)
-                            updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), streaming = true)
+                            updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), fileUrls, streaming = true)
+                        }
+                        is ChatApi.StreamEvent.File -> {
+                            // 文件气泡：累积文件 URL，去重后始终排在本轮正文（token）之后
+                            val url = ev.url.trim()
+                            if (url.isNotEmpty() && url !in fileUrls) fileUrls.add(url)
+                            updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), fileUrls, streaming = true)
                         }
                     }
                 }
@@ -936,6 +955,7 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         reasoning: String,
         toolCalls: List<String>,
         content: String,
+        fileUrls: List<String>,
         streaming: Boolean
     ) {
         val idx = messages.indexOfFirst { it.id == id }
@@ -946,6 +966,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
             if (reasoning.isNotEmpty()) add(ContentBlock.Reasoning(reasoning))
             toolCalls.forEach { if (it.isNotBlank()) add(ContentBlock.ToolCall(it)) }
             if (content.isNotEmpty()) add(ContentBlock.Text(content))
+            // 文件气泡：始终排在正文（token）之后
+            fileUrls.forEach { url ->
+                if (url.isNotBlank()) add(ContentBlock.File(remoteUrl = url, fileName = FileTypes.fileNameFromUrl(url)))
+            }
         }.ifEmpty { listOf(ContentBlock.Text("")) }
 
         messages[idx] = messages[idx].copy(blocks = blocks, isStreaming = streaming)

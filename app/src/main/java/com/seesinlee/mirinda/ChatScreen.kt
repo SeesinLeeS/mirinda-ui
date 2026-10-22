@@ -13,6 +13,7 @@ import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.text.selection.DisableSelection
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -42,7 +43,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.TableChart
 import androidx.compose.material.icons.filled.PictureAsPdf
@@ -955,6 +956,7 @@ private fun ImageBubble(block: ContentBlock.Image) {
  */
 @Composable
 private fun FileBubble(block: ContentBlock.File) {
+    val context = LocalContext.current
     val name = block.fileName.ifBlank { "文件" }
     val ext = FileTypes.extensionOf(name)
     val icon = when (ext) {
@@ -964,17 +966,43 @@ private fun FileBubble(block: ContentBlock.File) {
         "zip", "rar", "7z", "tar", "gz" -> Icons.Filled.FolderZip
         "mp3", "wav", "flac", "aac", "m4a" -> Icons.Filled.AudioFile
         "mp4", "mov", "avi", "mkv", "webm" -> Icons.Filled.VideoFile
-        else -> Icons.Filled.InsertDriveFile
+        else -> Icons.AutoMirrored.Filled.InsertDriveFile
     }
+    // 点击气泡 -> 用系统应用打开该文件地址（优先后端访问地址，其次本地 Uri）
+    val target: Uri? = remember(block.remoteUrl, block.localUri) {
+        when {
+            !block.remoteUrl.isNullOrBlank() -> runCatching { Uri.parse(block.remoteUrl) }.getOrNull()
+            block.localUri != null -> block.localUri
+            else -> null
+        }
+    }
+    // DisableSelection：助手消息整体包在 SelectionContainer 里（用于文字选择），
+    // 会拦截子元素的点按手势；这里局部关闭选择，确保文件气泡的点击能正常触发。
+    DisableSelection {
     Surface(
         color = ChatColors.UserBubble,
         contentColor = ChatColors.TextPrimary,
         shape = RoundedCornerShape(14.dp),
         shadowElevation = 1.dp,
-        modifier = Modifier.widthIn(max = 260.dp)
+        // 固定宽高，所有文件气泡尺寸一致
+        modifier = Modifier
+            .width(240.dp)
+            .height(64.dp)
+            .then(
+                if (target != null) Modifier.clickable {
+                    runCatching {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, target)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    }
+                } else Modifier
+            )
     ) {
         Row(
-            modifier = Modifier.padding(10.dp),
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             Surface(
@@ -997,7 +1025,7 @@ private fun FileBubble(block: ContentBlock.File) {
                     text = name,
                     color = ChatColors.TextPrimary,
                     style = MaterialTheme.typography.bodyMedium,
-                    maxLines = 2,
+                    maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
@@ -1007,6 +1035,7 @@ private fun FileBubble(block: ContentBlock.File) {
                 )
             }
         }
+    }
     }
 }
 
@@ -1473,7 +1502,7 @@ fun InputBar(
                                             verticalAlignment = Alignment.CenterVertically
                                         ) {
                                             Icon(
-                                                imageVector = Icons.Filled.InsertDriveFile,
+                                                imageVector = Icons.AutoMirrored.Filled.InsertDriveFile,
                                                 contentDescription = null,
                                                 tint = ChatColors.Accent,
                                                 modifier = Modifier.size(24.dp)

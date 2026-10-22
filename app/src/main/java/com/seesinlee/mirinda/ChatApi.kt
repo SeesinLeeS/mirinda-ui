@@ -37,7 +37,7 @@ object ChatApi {
     /**
      * 后端地址。
      */
-    private const val BASE_URL = "http://192.168.3.34:9090"
+    private const val BASE_URL = "http://10.83.254.33:9090"
 
     /**
      * 由后端返回的 OBS key 拼出可访问的文件 URL：`{BASE_URL}/file/{key}`。
@@ -51,6 +51,8 @@ object ChatApi {
         data class Token(val delta: String) : StreamEvent()      // 正文内容增量
         /** 工具调用提示：后端发起某个工具调用时推送，info 为提示内容（工具名/说明/JSON 等） */
         data class ToolCall(val info: String) : StreamEvent()
+        /** 文件事件：后端推送一个文件访问 URL，UI 单独用"文件气泡"（图标 + 文件名）展示 */
+        data class File(val url: String) : StreamEvent()
         /** 流最开始的元信息：带后端会话 id（新对话此时才产生）和标题 */
         data class Meta(val conversationId: String, val title: String) : StreamEvent()
     }
@@ -466,6 +468,7 @@ object ChatApi {
             // ---- 逐行读取并解析 SSE ----
             var eventName: String? = null
             val dataBuf = StringBuilder()
+            var sawData = false   // 本事件内是否已出现过 data: 行（用于正确拼回换行）
 
             conn.inputStream.bufferedReader().use { reader ->
                 while (currentCoroutineContext().isActive) {
@@ -482,6 +485,8 @@ object ChatApi {
                                 "token"     -> emit(StreamEvent.Token(data))
                                 // 工具调用提示：原样把 data 作为提示内容发出，UI 单独做一个气泡展示
                                 "tool_call" -> emit(StreamEvent.ToolCall(data))
+                                // 文件事件：data 为文件访问 URL，UI 用文件气泡展示（始终排在正文之后）
+                                "file"      -> emit(StreamEvent.File(data))
                                 "meta"      -> {
                                     // data: {"conversation_id":7,"title":"..."}
                                     runCatching {
@@ -500,6 +505,7 @@ object ChatApi {
                         }
                         eventName = null
                         dataBuf.setLength(0)
+                        sawData = false
                         continue
                     }
 
@@ -508,9 +514,12 @@ object ChatApi {
                             eventName = line.removePrefix("event:").trim()
                         }
                         line.startsWith("data:") -> {
-                            // gin 的 sse 对多行内容会拆成多条 data: 行，这里用 \n 拼回去
-                            if (dataBuf.isNotEmpty()) dataBuf.append("\n")
+                            // gin 的 sse 对多行内容会拆成多条 data: 行，这里用 \n 拼回去。
+                            // 注意：必须用 sawData 判断，而不是 dataBuf.isNotEmpty()——
+                            // 否则当 token 本身是纯换行/空行时（data: 行内容为空），换行会被整段吞掉。
+                            if (sawData) dataBuf.append("\n")
                             dataBuf.append(line.removePrefix("data:"))
+                            sawData = true
                         }
                         // 以 ":" 开头的是注释行；其它未知字段忽略
                     }
@@ -563,6 +572,7 @@ object ChatApi {
             // ---- 逐行读取并解析 SSE，只保留 token 事件 ----
             var eventName: String? = null
             val dataBuf = StringBuilder()
+            var sawData = false   // 本事件内是否已出现过 data: 行（用于正确拼回换行）
 
             conn.inputStream.bufferedReader().use { reader ->
                 while (currentCoroutineContext().isActive) {
@@ -576,6 +586,7 @@ object ChatApi {
                         }
                         eventName = null
                         dataBuf.setLength(0)
+                        sawData = false
                         continue
                     }
 
@@ -584,8 +595,10 @@ object ChatApi {
                             eventName = line.removePrefix("event:").trim()
                         }
                         line.startsWith("data:") -> {
-                            if (dataBuf.isNotEmpty()) dataBuf.append("\n")
+                            // 用 sawData 而非 dataBuf.isNotEmpty()，才能正确还原纯换行/空行 token
+                            if (sawData) dataBuf.append("\n")
                             dataBuf.append(line.removePrefix("data:"))
+                            sawData = true
                         }
                         // 注释行 / 未知字段忽略
                     }
