@@ -37,6 +37,10 @@ import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import android.content.Intent
+import android.app.DownloadManager
+import android.content.Context
+import android.os.Environment
+import android.webkit.MimeTypeMap
 import org.json.JSONArray
 import org.json.JSONObject
 import androidx.compose.material.icons.Icons
@@ -951,6 +955,55 @@ private fun ImageBubble(block: ContentBlock.Image) {
 }
 
 /**
+ * 用系统下载管理器把远程文件真正下载到设备的「下载」目录（而非在浏览器里在线预览）。
+ *
+ * 下载完成后会在通知栏显示"下载完成"，点击通知即可用对应应用打开。
+ * 若下载管理器不可用（理论不会），则回退为浏览器打开该 URL。
+ *
+ * 注意：通过 [DownloadManager] 写入公共「下载」目录不需要应用自行申请存储权限，
+ * 因为下载由系统进程代为执行。
+ *
+ * 鉴权：下载受保护文件时，必须带上用户 token（x-user-token 头），否则后端会拒绝。
+ * 这里与 [ChatApi] 的其它接口保持一致，统一从 [TokenStore] 取当前 token。
+ *
+ * @param url      文件可访问地址（download_url）
+ * @param filename 文件名（用于落盘文件名与通知标题）
+ */
+private fun downloadFile(context: Context, url: String, filename: String) {
+    val dm = context.getSystemService(DownloadManager::class.java)
+    if (dm == null) {
+        // 兜底：下载管理器取不到，退回到浏览器打开（可能仍是预览）
+        runCatching {
+            context.startActivity(
+                Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        }
+        return
+    }
+
+    val name = filename.ifBlank { FileTypes.fileNameFromUrl(url).ifBlank { "download" } }
+    val request = DownloadManager.Request(Uri.parse(url))
+        .setTitle(name)
+        .setDescription("正在下载文件…")
+        .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+        .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
+        .setAllowedOverMetered(true)
+        .setAllowedOverRoaming(true)
+        // 带上用户 token，让后端鉴权通过（与 ChatApi 的其它接口同一套头名）
+        .addRequestHeader(ChatApi.HEADER_TOKEN, TokenStore.getToken())
+
+    // 尽量带上 MIME 类型，便于下载完成后系统挑选合适的打开方式
+    FileTypes.extensionOf(name).let { ext ->
+        if (ext.isNotBlank()) {
+            MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)?.let { request.setMimeType(it) }
+        }
+    }
+
+    runCatching { dm.enqueue(request) }
+}
+
+/**
  * 文件卡片气泡：展示非图片文件（xlsx / docx / pdf 等）。
  * 左侧按文件类型显示一个图标，右侧显示文件名与类型标签。
  */
@@ -968,14 +1021,14 @@ private fun FileBubble(block: ContentBlock.File) {
         "mp4", "mov", "avi", "mkv", "webm" -> Icons.Filled.VideoFile
         else -> Icons.AutoMirrored.Filled.InsertDriveFile
     }
-    // 点击气泡 -> 用系统应用打开该文件地址（优先后端访问地址，其次本地 Uri）
-    val target: Uri? = remember(block.remoteUrl, block.localUri) {
-        when {
-            !block.remoteUrl.isNullOrBlank() -> runCatching { Uri.parse(block.remoteUrl) }.getOrNull()
-            block.localUri != null -> block.localUri
-            else -> null
-        }
-    }
+    // 点击气泡的行为：
+    //  - 远程文件（remoteUrl）：走系统下载管理器（DownloadManager），把文件真正下载到
+    //    「下载」目录，并在通知栏提示"下载完成"，点击通知即可用对应应用打开。
+    //    这避免了直接 ACTION_VIEW 打开 http(s) URL 时浏览器"在线预览"、不落盘的问题。
+    //  - 本地文件（发送前预览，仅 localUri）：直接以 ACTION_VIEW 打开。
+    val remoteUrl: String? = block.remoteUrl?.takeIf { it.isNotBlank() }
+    // 点击后是否弹出"是否下载"确认框
+    var showDownloadDialog by remember { mutableStateOf(false) }
     // DisableSelection：助手消息整体包在 SelectionContainer 里（用于文字选择），
     // 会拦截子元素的点按手势；这里局部关闭选择，确保文件气泡的点击能正常触发。
     DisableSelection {
@@ -989,12 +1042,19 @@ private fun FileBubble(block: ContentBlock.File) {
             .width(240.dp)
             .height(64.dp)
             .then(
-                if (target != null) Modifier.clickable {
-                    runCatching {
-                        context.startActivity(
-                            Intent(Intent.ACTION_VIEW, target)
-                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                        )
+                if (remoteUrl != null || block.localUri != null) Modifier.clickable {
+                    if (remoteUrl != null) {
+                        // 远程文件：先弹出确认框，确认后再真正下载
+                        showDownloadDialog = true
+                    } else {
+                        block.localUri?.let { uri ->
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, uri)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            }
+                        }
                     }
                 } else Modifier
             )
@@ -1036,6 +1096,36 @@ private fun FileBubble(block: ContentBlock.File) {
             }
         }
     }
+    }
+
+    // 点击远程文件气泡后弹出的"是否下载"确认框；确认才真正调用 DownloadManager 下载
+    if (showDownloadDialog && remoteUrl != null) {
+        AlertDialog(
+            onDismissRequest = { showDownloadDialog = false },
+            containerColor = ChatColors.TopBar,
+            title = {
+                Text("下载文件", color = ChatColors.TextPrimary)
+            },
+            text = {
+                Text(
+                    "是否下载文件「$name」？",
+                    color = ChatColors.TextSecondary
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDownloadDialog = false
+                    downloadFile(context, remoteUrl, name)
+                }) {
+                    Text("下载", color = ChatColors.Accent)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDownloadDialog = false }) {
+                    Text("取消", color = ChatColors.TextSecondary)
+                }
+            }
+        )
     }
 }
 

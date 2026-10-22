@@ -37,7 +37,7 @@ object ChatApi {
     /**
      * 后端地址。
      */
-    private const val BASE_URL = "http://10.83.254.33:9090"
+    private const val BASE_URL = "http://192.168.3.34:9090"
 
     /**
      * 由后端返回的 OBS key 拼出可访问的文件 URL：`{BASE_URL}/file/{key}`。
@@ -45,14 +45,62 @@ object ChatApi {
      */
     fun fileUrl(key: String): String = "$BASE_URL/file/$key"
 
+    /**
+     * 解析 SSE `file` 事件的 data，提取文件名与可访问地址（download_url）。
+     *
+     * 后端实际推送的是一段**嵌套 JSON**：
+     *   {"type":"text","text":"{\"content_type\":\"...\",\"download_url\":\"http://.../x.md\",\"filename\":\"x.md\",...}"}
+     * 外层 `text` 字段里又包了一层 JSON。本函数两层都尝试解析，
+     * 兼容以下情况：
+     *   - 标准嵌套结构：取内层 `filename` 与 `download_url`；
+     *   - 单层 JSON（直接含 filename/download_url）；
+     *   - 纯 URL 字符串（旧格式 / 历史消息）：回退为把整串当 URL，
+     *     文件名用 [FileTypes.fileNameFromUrl] 从链接尾部取。
+     *
+     * @return 第一项为文件名，第二项为可访问地址（downloadUrl）；任一缺失时回退解析，都不应为空串以外的安全值。
+     */
+    fun parseFileEvent(raw: String): Pair<String, String> {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return "" to ""
+
+        var filename = ""
+        var url = ""
+
+        // 外层：{"type":"text","text":"<内层JSON字符串>"}
+        val outer = runCatching { JSONObject(trimmed) }.getOrNull()
+        val candidate = outer?.optString("text")?.takeIf { it.isNotBlank() } ?: trimmed
+
+        // 内层（或本身就是 JSON）
+        val inner = runCatching { JSONObject(candidate) }.getOrNull()
+        if (inner != null) {
+            filename = inner.optString("filename").orEmpty()
+            // 优先 download_url，其次退而求其次 url / object_key 拼出的访问地址
+            url = inner.optString("download_url").orEmpty()
+                .ifBlank { inner.optString("url").orEmpty() }
+        }
+
+        // 没拿到 URL：说明不是 JSON，把整串当纯 URL 处理
+        if (url.isBlank()) url = trimmed
+
+        // 文件名兜底：从 URL 尾部截取
+        if (filename.isBlank()) filename = FileTypes.fileNameFromUrl(url)
+
+        return filename to url
+    }
+
     /** 流式事件类型 */
     sealed class StreamEvent {
         data class Reasoning(val delta: String) : StreamEvent()  // 推理内容增量
         data class Token(val delta: String) : StreamEvent()      // 正文内容增量
         /** 工具调用提示：后端发起某个工具调用时推送，info 为提示内容（工具名/说明/JSON 等） */
         data class ToolCall(val info: String) : StreamEvent()
-        /** 文件事件：后端推送一个文件访问 URL，UI 单独用"文件气泡"（图标 + 文件名）展示 */
-        data class File(val url: String) : StreamEvent()
+        /**
+         * 文件事件：后端推送一个文件信息（嵌套 JSON，见 [parseFileEvent]），
+         * UI 单独用"文件气泡"（图标 + 文件名）展示，点击以 downloadUrl 打开。
+         * @param filename    文件名（如 helloworld.md），用于气泡展示与类型判断
+         * @param downloadUrl 文件的真实可访问地址（download_url），点击时打开
+         */
+        data class File(val filename: String, val downloadUrl: String) : StreamEvent()
         /** 流最开始的元信息：带后端会话 id（新对话此时才产生）和标题 */
         data class Meta(val conversationId: String, val title: String) : StreamEvent()
     }
@@ -75,8 +123,8 @@ object ChatApi {
     /** 登录结果 */
     data class LoginResult(val ok: Boolean, val httpCode: Int, val bizCode: Int, val message: String)
 
-    /** 鉴权头名（后端从该 header 取 token） */
-    private const val HEADER_TOKEN = "x-user-token"
+    /** 鉴权头名（后端从该 header 取 token）。非 private，供下载等场景复用。 */
+    const val HEADER_TOKEN = "x-user-token"
 
     /** 给连接统一加上 token 请求头 */
     private fun HttpURLConnection.applyAuth() {
@@ -485,8 +533,12 @@ object ChatApi {
                                 "token"     -> emit(StreamEvent.Token(data))
                                 // 工具调用提示：原样把 data 作为提示内容发出，UI 单独做一个气泡展示
                                 "tool_call" -> emit(StreamEvent.ToolCall(data))
-                                // 文件事件：data 为文件访问 URL，UI 用文件气泡展示（始终排在正文之后）
-                                "file"      -> emit(StreamEvent.File(data))
+                                // 文件事件：data 为嵌套 JSON（见 parseFileEvent），
+                                // 解析出文件名与可访问地址，UI 用文件气泡展示（始终排在正文之后）
+                                "file"      -> {
+                                    val (filename, downloadUrl) = parseFileEvent(data)
+                                    emit(StreamEvent.File(filename = filename, downloadUrl = downloadUrl))
+                                }
                                 "meta"      -> {
                                     // data: {"conversation_id":7,"title":"..."}
                                     runCatching {

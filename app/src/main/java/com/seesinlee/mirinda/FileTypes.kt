@@ -19,15 +19,22 @@ object FileTypes {
 
     /**
      * 从链接 / 路径 / 文件名中解析出文件名。
-     *  - 去掉查询串（? 后）与锚点（# 后）；
+     * 处理 SSE 文件事件里形如 `http://host:port/file/helloworld.md` 的访问地址，
+     * 稳定取到 `helloworld.md`，并清掉文件名后面可能跟着的"尾巴"：
+     *  - 去掉整条 URL 层面的查询串（? 后）与锚点（# 后）；
      *  - 取最后一个 '/' 之后的片段；
+     *  - 片段内若还残留 ? # 或首尾空白（后端把参数 / 换行直接拼在文件名后），再次截断并 trim；
      *  - 做一次 URL 解码（处理 %20 等转义）。
      */
     fun fileNameFromUrl(url: String?): String {
         if (url.isNullOrBlank()) return ""
-        val noQuery = url.substringBefore('?').substringBefore('#')
-        val last = noQuery.trimEnd('/').substringAfterLast('/')
-        return runCatching { URLDecoder.decode(last, "UTF-8") }.getOrDefault(last)
+        // 1) 整条 URL 层面先去掉锚点与查询串
+        val base = url.substringBefore('#').substringBefore('?')
+        // 2) 取最后一个 '/' 之后的路径片段
+        val segment = base.trimEnd('/').substringAfterLast('/')
+        // 3) 片段内兜底截断：? # 以及首尾空白（覆盖"只截了前面、后面尾巴保留"的情况）
+        val cleaned = segment.substringBefore('?').substringBefore('#').trim()
+        return runCatching { URLDecoder.decode(cleaned, "UTF-8") }.getOrDefault(cleaned)
     }
 
     /** 取文件扩展名（小写、不含点）；无扩展名返回空串。 */
