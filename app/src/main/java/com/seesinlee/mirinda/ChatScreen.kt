@@ -808,10 +808,6 @@ fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
         val stripped = stripInterruptions(msg.blocks)
         val reasoningBlock = stripped.blocks.filterIsInstance<ContentBlock.Reasoning>().firstOrNull()
         val otherBlocks = stripped.blocks.filterNot { it is ContentBlock.Reasoning }
-        val hasReply = otherBlocks.any {
-            (it is ContentBlock.Text && it.text.isNotBlank()) ||
-                it is ContentBlock.Image || it is ContentBlock.File
-        }
 
         SelectionContainer {
             Column(
@@ -820,18 +816,19 @@ fun MessageBubble(msg: ChatMessage, onRetry: (String) -> Unit = {}) {
                     .padding(end = 8.dp)
             ) {
             if (reasoningBlock != null && reasoningBlock.text.isNotBlank()) {
-                // thinking = 仍在思考且正文还没开始 -> 面板展开并显示"深度思考中…"
+                // thinking 跟随该推理块自身的流式状态：只要本回合还在传输（即便正文 token 已来），
+                // 推理卡片就保持"深度思考中…"，不再因正文出现而提前结束加载态。
                 ReasoningPanel(
                     text = reasoningBlock.text,
-                    thinking = msg.isStreaming && !hasReply
+                    thinking = reasoningBlock.isStreaming
                 )
                 Spacer(Modifier.height(8.dp))
             }
-            // 工具调用气泡与"深度思考"一样可折叠：仍在流式且是最后一个块时视为"调用中"（展开），
-            // 一旦后面出现新块（下一个工具调用 / 正文）或流式结束，则收起成一行"工具调用"。
+            // 工具调用卡片的"调用中"状态同样跟随块自身的流式状态：
+            // 最后一条工具调用在整回合结束前都保持加载态，不会被后续 token 提前终止。
             val lastOtherIndex = otherBlocks.lastIndex
             otherBlocks.forEachIndexed { index, block ->
-                val toolActive = msg.isStreaming && index == lastOtherIndex
+                val toolActive = block is ContentBlock.ToolCall && block.isStreaming
                 MessageBlock(block, ChatColors.TextPrimary, toolActive)
                 // 块间距与"深度思考"面板一致（8.dp），避免工具气泡紧贴正文内容
                 if (index != lastOtherIndex) Spacer(Modifier.height(8.dp))
@@ -930,10 +927,25 @@ private fun UserBlockBubble(block: ContentBlock) {
     }
 }
 
-/** 图片气泡：单独成块展示一张图片（本地或远程）。 */
+/**
+ * 图片气泡：单独成块展示一张图片（本地或远程）。
+ * 点击行为：
+ *  - 远程图片（remoteUrl）：弹"是否下载"确认框，确认后走系统下载管理器落盘到「下载」目录；
+ *  - 本地图片（发送前预览，仅 localUri）：直接以 ACTION_VIEW 打开。
+ * 逻辑与 [FileBubble] 一致，仅展示形态不同（图片预览 vs 文件卡片）。
+ */
 @Composable
 private fun ImageBubble(block: ContentBlock.Image) {
-    val model: Any? = block.localUri ?: block.remoteUrl
+    val context = LocalContext.current
+    val remoteUrl: String? = block.remoteUrl?.takeIf { it.isNotBlank() }
+    val localUri = block.localUri
+    val name = block.fileName.ifBlank { FileTypes.fileNameFromUrl(block.remoteUrl) }
+    // 点击后是否弹出"是否下载"确认框
+    var showDownloadDialog by remember { mutableStateOf(false) }
+    // 地址非法时弹出的"确定"提示框
+    var showInvalidUrlDialog by remember { mutableStateOf(false) }
+
+    val model: Any? = remoteUrl ?: localUri
     if (model != null) {
         // 关键：限制解码尺寸（最长边 720px），避免历史里大图在全设备（尤其低配真机/模拟器）
         // 上因原图过大而 OOM 崩溃；远程/本地图统一走 Coil 的降采样与磁盘缓存。
@@ -941,7 +953,18 @@ private fun ImageBubble(block: ContentBlock.Image) {
             .data(model)
             .size(720)
             .crossfade(true)
+            .apply {
+                // 远程图片来自需要鉴权的后端 /file 接口：必须带上 x-user-token，
+                // 否则服务端返回 401，Coil 加载失败，气泡只剩空白占位。
+                if (remoteUrl != null) {
+                    val token = TokenStore.getToken()
+                    if (token.isNotBlank()) addHeader(ChatApi.HEADER_TOKEN, token)
+                }
+            }
             .build()
+        // DisableSelection：助手消息整体包在 SelectionContainer 里（用于文字选择），
+        // 会拦截子元素的点按手势；这里局部关闭选择，确保图片气泡的点击能正常触发。
+        DisableSelection {
         AsyncImage(
             model = imageRequest,
             contentDescription = block.fileName.ifBlank { null },
@@ -950,6 +973,73 @@ private fun ImageBubble(block: ContentBlock.Image) {
                 .widthIn(max = 220.dp)
                 .heightIn(max = 220.dp)
                 .clip(RoundedCornerShape(14.dp))
+                .then(
+                    if (remoteUrl != null || localUri != null) Modifier.clickable {
+                        if (remoteUrl != null) {
+                            // 远程图片：先弹出确认框，确认后再真正下载
+                            showDownloadDialog = true
+                        } else if (localUri != null) {
+                            // 本地图片（发送前预览）：直接以 ACTION_VIEW 打开
+                            runCatching {
+                                context.startActivity(
+                                    Intent(Intent.ACTION_VIEW, localUri)
+                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                )
+                            }
+                        }
+                    } else Modifier
+                )
+        )
+        }
+    }
+
+    // 点击远程图片气泡后弹出的"是否下载"确认框；确认才真正调用 DownloadManager 下载
+    if (showDownloadDialog && remoteUrl != null) {
+        AlertDialog(
+            onDismissRequest = { showDownloadDialog = false },
+            containerColor = ChatColors.TopBar,
+            title = {
+                Text("下载图片", color = ChatColors.TextPrimary)
+            },
+            text = {
+                Text(
+                    "是否下载图片「$name」？",
+                    color = ChatColors.TextSecondary
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDownloadDialog = false
+                    // 地址非法时不下载，改为弹"确定"提示框，避免 DownloadManager 抛异常崩溃
+                    if (isValidHttpUrl(remoteUrl)) {
+                        downloadFile(context, remoteUrl, name)
+                    } else {
+                        showInvalidUrlDialog = true
+                    }
+                }) {
+                    Text("下载", color = ChatColors.Accent)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDownloadDialog = false }) {
+                    Text("取消", color = ChatColors.TextSecondary)
+                }
+            }
+        )
+    }
+
+    // 地址非法时的提示框：只有一个"确定"按钮，点击即关闭。
+    if (showInvalidUrlDialog) {
+        AlertDialog(
+            onDismissRequest = { showInvalidUrlDialog = false },
+            containerColor = ChatColors.TopBar,
+            title = { Text("无法下载", color = ChatColors.TextPrimary) },
+            text = { Text("图片地址无效，无法下载。", color = ChatColors.TextSecondary) },
+            confirmButton = {
+                TextButton(onClick = { showInvalidUrlDialog = false }) {
+                    Text("确定", color = ChatColors.Accent)
+                }
+            }
         )
     }
 }
@@ -969,7 +1059,20 @@ private fun ImageBubble(block: ContentBlock.Image) {
  * @param url      文件可访问地址（download_url）
  * @param filename 文件名（用于落盘文件名与通知标题）
  */
+/**
+ * 判断字符串是否为可用的 http(s) 下载地址。
+ * 用于拦截非法 URL，避免直接交给 DownloadManager 构造 Request 时抛
+ * IllegalArgumentException 导致应用崩溃。
+ */
+private fun isValidHttpUrl(url: String): Boolean {
+    val u = runCatching { Uri.parse(url) }.getOrNull() ?: return false
+    val s = u.scheme?.lowercase() ?: return false
+    return s == "http" || s == "https"
+}
+
 private fun downloadFile(context: Context, url: String, filename: String) {
+    // 防御：非法 / 非 http(s) 地址直接放弃，绝不交给 DownloadManager（其构造会抛异常）。
+    if (!isValidHttpUrl(url)) return
     val dm = context.getSystemService(DownloadManager::class.java)
     if (dm == null) {
         // 兜底：下载管理器取不到，退回到浏览器打开（可能仍是预览）
@@ -983,22 +1086,26 @@ private fun downloadFile(context: Context, url: String, filename: String) {
     }
 
     val name = filename.ifBlank { FileTypes.fileNameFromUrl(url).ifBlank { "download" } }
-    val request = DownloadManager.Request(Uri.parse(url))
-        .setTitle(name)
-        .setDescription("正在下载文件…")
-        .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-        .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
-        .setAllowedOverMetered(true)
-        .setAllowedOverRoaming(true)
-        // 带上用户 token，让后端鉴权通过（与 ChatApi 的其它接口同一套头名）
-        .addRequestHeader(ChatApi.HEADER_TOKEN, TokenStore.getToken())
-
-    // 尽量带上 MIME 类型，便于下载完成后系统挑选合适的打开方式
-    FileTypes.extensionOf(name).let { ext ->
-        if (ext.isNotBlank()) {
-            MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)?.let { request.setMimeType(it) }
-        }
-    }
+    // 构造 Request 同样可能抛异常，整体包进 runCatching 兜底，避免任何意外地址导致崩溃。
+    val request = runCatching {
+        DownloadManager.Request(Uri.parse(url))
+            .setTitle(name)
+            .setDescription("正在下载文件…")
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name)
+            .setAllowedOverMetered(true)
+            .setAllowedOverRoaming(true)
+            // 带上用户 token，让后端鉴权通过（与 ChatApi 的其它接口同一套头名）
+            .addRequestHeader(ChatApi.HEADER_TOKEN, TokenStore.getToken())
+            .also { req ->
+                // 尽量带上 MIME 类型，便于下载完成后系统挑选合适的打开方式
+                FileTypes.extensionOf(name).let { ext ->
+                    if (ext.isNotBlank()) {
+                        MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)?.let { req.setMimeType(it) }
+                    }
+                }
+            }
+    }.getOrNull() ?: return
 
     runCatching { dm.enqueue(request) }
 }
@@ -1029,6 +1136,8 @@ private fun FileBubble(block: ContentBlock.File) {
     val remoteUrl: String? = block.remoteUrl?.takeIf { it.isNotBlank() }
     // 点击后是否弹出"是否下载"确认框
     var showDownloadDialog by remember { mutableStateOf(false) }
+    // 地址非法时弹出的"确定"提示框
+    var showInvalidUrlDialog by remember { mutableStateOf(false) }
     // DisableSelection：助手消息整体包在 SelectionContainer 里（用于文字选择），
     // 会拦截子元素的点按手势；这里局部关闭选择，确保文件气泡的点击能正常触发。
     DisableSelection {
@@ -1115,7 +1224,12 @@ private fun FileBubble(block: ContentBlock.File) {
             confirmButton = {
                 TextButton(onClick = {
                     showDownloadDialog = false
-                    downloadFile(context, remoteUrl, name)
+                    // 地址非法时不下载，改为弹"确定"提示框，避免 DownloadManager 抛异常崩溃
+                    if (isValidHttpUrl(remoteUrl)) {
+                        downloadFile(context, remoteUrl, name)
+                    } else {
+                        showInvalidUrlDialog = true
+                    }
                 }) {
                     Text("下载", color = ChatColors.Accent)
                 }
@@ -1123,6 +1237,21 @@ private fun FileBubble(block: ContentBlock.File) {
             dismissButton = {
                 TextButton(onClick = { showDownloadDialog = false }) {
                     Text("取消", color = ChatColors.TextSecondary)
+                }
+            }
+        )
+    }
+
+    // 地址非法时的提示框：只有一个"确定"按钮，点击即关闭。
+    if (showInvalidUrlDialog) {
+        AlertDialog(
+            onDismissRequest = { showInvalidUrlDialog = false },
+            containerColor = ChatColors.TopBar,
+            title = { Text("无法下载", color = ChatColors.TextPrimary) },
+            text = { Text("文件地址无效，无法下载。", color = ChatColors.TextSecondary) },
+            confirmButton = {
+                TextButton(onClick = { showInvalidUrlDialog = false }) {
+                    Text("确定", color = ChatColors.Accent)
                 }
             }
         )

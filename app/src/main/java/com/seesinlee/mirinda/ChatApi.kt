@@ -37,13 +37,21 @@ object ChatApi {
     /**
      * 后端地址。
      */
-    private const val BASE_URL = "http://192.168.3.34:9090"
+    private const val BASE_URL = "http://gs5956mf606.vicp.fun"
 
     /**
-     * 由后端返回的 OBS key 拼出可访问的文件 URL：`{BASE_URL}/file/{key}`。
+     * 由后端返回的 OBS key 拼出可访问的文件 URL。
+     *
+     * 按后端要求，访问地址需在文件名前加上 `user_files/{token}/` 路径段：
+     *   `{BASE_URL}/file/user_files/{token}/{key}`
+     * 其中 token 取自 [TokenStore]（与请求头 x-user-token 一致）。
      * 上传成功后把本函数生成的 URL 作为 files 字段传给 /agent/send。
      */
-    fun fileUrl(key: String): String = "$BASE_URL/file/$key"
+    fun fileUrl(key: String): String {
+        val token = TokenStore.getToken()
+        val prefix = if (token.isBlank()) "user_files/" else "user_files/$token/"
+        return "$BASE_URL/file/$prefix$key"
+    }
 
     /**
      * 解析 SSE `file` 事件的 data，提取文件名与可访问地址（download_url）。
@@ -59,24 +67,69 @@ object ChatApi {
      *
      * @return 第一项为文件名，第二项为可访问地址（downloadUrl）；任一缺失时回退解析，都不应为空串以外的安全值。
      */
-    fun parseFileEvent(raw: String): Pair<String, String> {
+    /**
+     * 解析出的单个文件信息。
+     * @param filename    文件名（如 doubao_xxx.jpg），用于气泡展示与类型判断
+     * @param downloadUrl 文件的真实可访问地址（download_url），点击时打开/下载
+     * @param isImage     是否为图片：当 text 的值为 JSON 数组（图片列表），或单对象的
+     *                   content_type 以 "image/" 开头 / 文件名后缀为图片时为真。
+     *                   为 true 时 UI 会额外用"图片气泡"预览，并仍可走文件下载逻辑。
+     */
+    data class FileInfo(
+        val filename: String,
+        val downloadUrl: String,
+        val isImage: Boolean
+    )
+
+    /**
+     * 解析 SSE `file` 事件的 data，提取文件名、可访问地址（download_url）与是否为图片。
+     *
+     * 后端实际推送的可能是：
+     *  - 图片列表：`{"type":"text","text":"[{\"object_key\":\"...\",\"filename\":\"x.jpg\",\"content_type\":\"image/jpeg\",\"download_url\":\"http://.../x.jpg\",...}]"}`
+     *    内层 text 是一个 JSON 数组（可能含多个图片对象），视为图片，取首张的 download_url 展示；
+     *  - 单文件：`{"type":"text","text":"{...filename/download_url/object_key...}"}`；
+     *  - 单层 JSON（直接含 filename/download_url）；
+     *  - 纯 URL 字符串（旧格式 / 历史消息）。
+     *
+     * 本函数两层都尝试解析，并对数组与对象分别提取；数组一律视为图片，
+     * 单对象则依据 content_type / 文件名后缀判断。
+     *
+     * @return [FileInfo]，url 缺失时回退为整串，文件名兜底从 URL 尾部取。
+     */
+    fun parseFileEvent(raw: String): FileInfo {
         val trimmed = raw.trim()
-        if (trimmed.isEmpty()) return "" to ""
+        if (trimmed.isEmpty()) return FileInfo("", "", false)
 
         var filename = ""
         var url = ""
+        var isImage = false
 
         // 外层：{"type":"text","text":"<内层JSON字符串>"}
         val outer = runCatching { JSONObject(trimmed) }.getOrNull()
         val candidate = outer?.optString("text")?.takeIf { it.isNotBlank() } ?: trimmed
 
-        // 内层（或本身就是 JSON）
-        val inner = runCatching { JSONObject(candidate) }.getOrNull()
-        if (inner != null) {
-            filename = inner.optString("filename").orEmpty()
-            // 优先 download_url，其次退而求其次 url / object_key 拼出的访问地址
-            url = inner.optString("download_url").orEmpty()
-                .ifBlank { inner.optString("url").orEmpty() }
+        // 内层可能是 JSON 数组（图片列表）或 JSON 对象（单文件）
+        val innerArray = runCatching { JSONArray(candidate) }.getOrNull()
+        val innerObject = if (innerArray == null) runCatching { JSONObject(candidate) }.getOrNull() else null
+
+        when {
+            innerArray != null && innerArray.length() > 0 -> {
+                // 视为图片列表：取首张解析 download_url / filename
+                isImage = true
+                val obj = innerArray.optJSONObject(0) ?: JSONObject()
+                filename = obj.optString("filename").orEmpty()
+                url = obj.optString("download_url").orEmpty()
+                    .ifBlank { obj.optString("url").orEmpty() }
+            }
+            innerObject != null -> {
+                filename = innerObject.optString("filename").orEmpty()
+                url = innerObject.optString("download_url").orEmpty()
+                    .ifBlank { innerObject.optString("url").orEmpty() }
+                    .ifBlank { innerObject.optString("object_key").orEmpty() }
+                val contentType = innerObject.optString("content_type").orEmpty()
+                isImage = contentType.startsWith("image/", ignoreCase = true) ||
+                    FileTypes.isImageName(filename)
+            }
         }
 
         // 没拿到 URL：说明不是 JSON，把整串当纯 URL 处理
@@ -85,7 +138,7 @@ object ChatApi {
         // 文件名兜底：从 URL 尾部截取
         if (filename.isBlank()) filename = FileTypes.fileNameFromUrl(url)
 
-        return filename to url
+        return FileInfo(filename = filename, downloadUrl = url, isImage = isImage)
     }
 
     /** 流式事件类型 */
@@ -99,8 +152,14 @@ object ChatApi {
          * UI 单独用"文件气泡"（图标 + 文件名）展示，点击以 downloadUrl 打开。
          * @param filename    文件名（如 helloworld.md），用于气泡展示与类型判断
          * @param downloadUrl 文件的真实可访问地址（download_url），点击时打开
+         * @param isImage     是否为图片（见 [parseFileEvent]）：为真时 UI 会额外展示
+         *                    "图片气泡"预览，图片气泡位于文件气泡上方，点击同样弹下载确认框。
          */
-        data class File(val filename: String, val downloadUrl: String) : StreamEvent()
+        data class File(
+            val filename: String,
+            val downloadUrl: String,
+            val isImage: Boolean = false
+        ) : StreamEvent()
         /** 流最开始的元信息：带后端会话 id（新对话此时才产生）和标题 */
         data class Meta(val conversationId: String, val title: String) : StreamEvent()
     }
@@ -487,7 +546,7 @@ object ChatApi {
             setRequestProperty("Accept", "text/event-stream")
             applyAuth()
             connectTimeout = 15_000
-            readTimeout = 60_000   // 两个 token 之间的最大等待；流式场景给足余量
+            readTimeout = 600_000   // 两个 token 之间的最大等待；流式场景给足余量
         }
 
         // ---- 请求体：{"message": "...", "model": "...", "files": [...]} ----
@@ -536,8 +595,14 @@ object ChatApi {
                                 // 文件事件：data 为嵌套 JSON（见 parseFileEvent），
                                 // 解析出文件名与可访问地址，UI 用文件气泡展示（始终排在正文之后）
                                 "file"      -> {
-                                    val (filename, downloadUrl) = parseFileEvent(data)
-                                    emit(StreamEvent.File(filename = filename, downloadUrl = downloadUrl))
+                                    val info = parseFileEvent(data)
+                                    emit(
+                                        StreamEvent.File(
+                                            filename = info.filename,
+                                            downloadUrl = info.downloadUrl,
+                                            isImage = info.isImage
+                                        )
+                                    )
                                 }
                                 "meta"      -> {
                                     // data: {"conversation_id":7,"title":"..."}

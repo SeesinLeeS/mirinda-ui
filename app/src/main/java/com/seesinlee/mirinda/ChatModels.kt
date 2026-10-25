@@ -16,14 +16,21 @@ enum class Role { USER, ASSISTANT }
  * 内容块：用密封类表示"有限的几种类型"。
  */
 sealed class ContentBlock {
+    /**
+     * 该块是否仍在流式传输中（卡片级"加载中"指示）。
+     * 与整条消息的 [ChatMessage.isStreaming] 解耦：即使整条回复已经开始吐正文 token，
+     * 某条推理 / 工具调用块仍可保持"加载中"，直到整回合真正结束。
+     */
+    abstract val isStreaming: Boolean
+
     /** 文字块（正式回复 / 普通文本） */
-    data class Text(val text: String) : ContentBlock()
+    data class Text(val text: String, override val isStreaming: Boolean = false) : ContentBlock()
 
     /**
      * 推理块（模型"思考过程"，对应后端的 reasoning 事件）。
      * 单独成块，UI 会用可折叠的"深度思考"面板来展示。
      */
-    data class Reasoning(val text: String) : ContentBlock()
+    data class Reasoning(val text: String, override val isStreaming: Boolean = false) : ContentBlock()
 
     /**
      * 图片块（单独成一个气泡，与文字内容分离）。
@@ -34,7 +41,8 @@ sealed class ContentBlock {
     data class Image(
         val localUri: Uri? = null,
         val remoteUrl: String? = null,
-        val fileName: String = ""
+        val fileName: String = "",
+        override val isStreaming: Boolean = false
     ) : ContentBlock()
 
     /**
@@ -47,7 +55,8 @@ sealed class ContentBlock {
     data class File(
         val localUri: Uri? = null,
         val remoteUrl: String? = null,
-        val fileName: String = ""
+        val fileName: String = "",
+        override val isStreaming: Boolean = false
     ) : ContentBlock()
 
     /**
@@ -57,7 +66,7 @@ sealed class ContentBlock {
      *      （`[{"name":"...","type":"..."}]`，可能一次推送多个或单个对象），UI 会解析成
      *       「工具名 + 类型标签」逐条展示；解析失败时回退原样展示文本。
      */
-    data class ToolCall(val text: String) : ContentBlock()
+    data class ToolCall(val text: String, override val isStreaming: Boolean = false) : ContentBlock()
 }
 
 /**

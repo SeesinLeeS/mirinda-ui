@@ -561,8 +561,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         var reasoning = StringBuilder()
         var content = StringBuilder()
         var toolCalls = mutableListOf<String>()
-        // 文件气泡：本轮助手回复里的文件访问 URL（始终排在正文之后，与流式一致）
-        var assistantFiles = mutableListOf<Pair<String, String>>()
+        // 文件气泡：本轮助手回复里的文件信息（始终排在正文之后，与流式一致）
+        var assistantFiles = mutableListOf<ChatApi.FileInfo>()
         var hasAssistant = false
         var groupId: String? = null
 
@@ -573,8 +573,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 if (reasoning.isNotEmpty()) add(ContentBlock.Reasoning(reasoning.toString()))
                 toolCalls.forEach { if (it.isNotBlank()) add(ContentBlock.ToolCall(it)) }
                 if (content.isNotEmpty()) add(ContentBlock.Text(content.toString()))
-                assistantFiles.forEach { (filename, url) ->
-                    if (url.isNotBlank()) add(ContentBlock.File(remoteUrl = url, fileName = filename))
+                assistantFiles.forEach { info ->
+                    if (info.downloadUrl.isBlank()) return@forEach
+                    if (info.isImage) {
+                        // 图片型 file：只展示图片预览气泡，不再展示文件卡片气泡
+                        add(ContentBlock.Image(remoteUrl = info.downloadUrl, fileName = info.filename))
+                    } else {
+                        add(ContentBlock.File(remoteUrl = info.downloadUrl, fileName = info.filename))
+                    }
                 }
             }.ifEmpty { listOf(ContentBlock.Text("")) }
             result.add(ChatMessage(id = "srv-a-${groupId ?: newId()}", role = Role.ASSISTANT, blocks = blocks))
@@ -603,8 +609,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     "file" -> {   // 文件事件：单独成一个"文件气泡"，始终排在正文之后
                         if (groupId == null) groupId = b.id
-                        val (fn, dl) = ChatApi.parseFileEvent(b.part)
-                        if (dl.isNotBlank()) assistantFiles.add(fn to dl)
+                        val info = ChatApi.parseFileEvent(b.part)
+                        if (info.downloadUrl.isNotBlank()) assistantFiles.add(info)
                         hasAssistant = true
                     }
                     else -> {   // token / image / 其它都并入正文
@@ -620,10 +626,10 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 // 根据链接里的文件名后缀判断是图片还是普通文件，决定如何展示。
                 val blocks = when (b.messageType) {
                     "image", "file" -> {
-                        val (fn, dl) = ChatApi.parseFileEvent(b.part)
-                        val name = fn.ifBlank { FileTypes.fileNameFromUrl(b.part) }
-                        val url = dl.ifBlank { b.part }
-                        if (b.messageType == "image" || FileTypes.isImageName(name)) {
+                        val info = ChatApi.parseFileEvent(b.part)
+                        val name = info.filename.ifBlank { FileTypes.fileNameFromUrl(b.part) }
+                        val url = info.downloadUrl.ifBlank { b.part }
+                        if (b.messageType == "image" || FileTypes.isImageName(name) || info.isImage) {
                             listOf(ContentBlock.Image(remoteUrl = url, fileName = name))
                         } else {
                             listOf(ContentBlock.File(remoteUrl = url, fileName = name))
@@ -845,8 +851,8 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
         val content = StringBuilder()
         // 工具调用提示：每收到一个 tool_call 事件追加一条，渲染成独立气泡
         val toolCalls = mutableListOf<String>()
-        // 文件事件：收到的 (文件名, 访问地址) 对（渲染成独立"文件气泡"，始终排在正文之后）
-        val fileUrls = mutableListOf<Pair<String, String>>()
+        // 文件事件：收到的文件信息（渲染成独立"文件气泡"，始终排在正文之后；图片额外成预览气泡）
+        val fileUrls = mutableListOf<ChatApi.FileInfo>()
 
         // 当前会话的后端 id：新对话为空 -> 传 0，后端新建并在 meta 事件回传真实 id
         val currentServerId = conversations
@@ -877,11 +883,11 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 .onCompletion {
                     isLoading.value = false
-                    // 结束时取消流式标记，并存档
-                    val idx = messages.indexOfFirst { it.id == assistantId }
-                    if (idx >= 0 && messages[idx].isStreaming) {
-                        messages[idx] = messages[idx].copy(isStreaming = false)
-                    }
+                    // 结束时把卡片级流式标记一并取消（保留已接收内容），并存档。
+                    // 关键修复：之前仅整条消息 isStreaming=false，推理 / 工具调用卡片的
+                    // "加载中"态是 UI 用位置启发式推断的，正文 token 一到就会被误判为结束；
+                    // 现在由块自身的 isStreaming 驱动，整回合结束才会真正停止加载态。
+                    updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), fileUrls, streaming = false)
                     saveMessagesToCurrent()
                 }
                 .collect { ev ->
@@ -907,10 +913,14 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
                             updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), fileUrls, streaming = true)
                         }
                         is ChatApi.StreamEvent.File -> {
-                            // 文件气泡：累积 (文件名, 下载地址)，去重后始终排在本轮正文（token）之后
+                            // 文件 / 图片事件：累积 FileInfo，去重后始终排在本轮正文（token）之后；
+                            // 图片会额外渲染成图片气泡（位于文件气泡上方）。
                             val fn = ev.filename.trim()
                             val dl = ev.downloadUrl.trim()
-                            if (dl.isNotEmpty() && (fn to dl) !in fileUrls) fileUrls.add(fn to dl)
+                            val info = ChatApi.FileInfo(fn, dl, ev.isImage)
+                            if (dl.isNotEmpty() && fileUrls.none { it.filename == fn && it.downloadUrl == dl }) {
+                                fileUrls.add(info)
+                            }
                             updateAssistant(assistantId, reasoning.toString(), toolCalls, content.toString(), fileUrls, streaming = true)
                         }
                     }
@@ -952,27 +962,45 @@ class ChatViewModel(application: Application) : AndroidViewModel(application) {
      *   - 有推理内容 -> 放一个 Reasoning 块（UI 用可折叠的"深度思考"面板展示）
      *   - 有正文内容 -> 放一个 Text 块（正式回复，展示在思考面板下方）
      * 这样就实现了"先思考、再回复"：思考阶段只有 Reasoning 块，
-     * 正文一开始出现，Reasoning 面板会自动折叠（由 UI 根据 isStreaming 控制）。
+     * 正文开始后推理面板保持展开（"深度思考中…"），直到整回合结束才折叠为"已深度思考"。
+     * 卡片级加载态由块自身的 isStreaming 驱动，而非 UI 的位置启发式，
+     * 因此正文 token 到达后推理 / 工具调用卡片不会提前结束加载态。
      */
     private fun updateAssistant(
         id: String,
         reasoning: String,
         toolCalls: List<String>,
         content: String,
-        fileUrls: List<Pair<String, String>>,
+        fileUrls: List<ChatApi.FileInfo>,
         streaming: Boolean
     ) {
         val idx = messages.indexOfFirst { it.id == id }
         if (idx < 0) return
 
+        // 卡片级流式标记：只要整回合仍在传输（streaming=true），
+        // 推理块就保持"思考中"，最后一条工具调用保持"调用中"——
+        // 即使后端已经开始推送正文 token，这些卡片也不会提前结束加载态。
+        // 当 streaming=false（整回合结束）时，所有块一并停止加载态。
+        val lastToolIdx = toolCalls.indexOfLast { it.isNotBlank() }
+
         // 块顺序：思考 -> 工具调用提示（可多个）-> 正文回复
         val blocks = buildList {
-            if (reasoning.isNotEmpty()) add(ContentBlock.Reasoning(reasoning))
-            toolCalls.forEach { if (it.isNotBlank()) add(ContentBlock.ToolCall(it)) }
-            if (content.isNotEmpty()) add(ContentBlock.Text(content))
-            // 文件气泡：始终排在正文（token）之后；remoteUrl 用可访问地址，fileName 用真实文件名
-            fileUrls.forEach { (filename, url) ->
-                if (url.isNotBlank()) add(ContentBlock.File(remoteUrl = url, fileName = filename))
+            if (reasoning.isNotEmpty()) add(ContentBlock.Reasoning(reasoning, isStreaming = streaming))
+            toolCalls.forEachIndexed { i, t ->
+                if (t.isNotBlank()) add(ContentBlock.ToolCall(t, isStreaming = streaming && i == lastToolIdx))
+            }
+            if (content.isNotEmpty()) add(ContentBlock.Text(content, isStreaming = streaming))
+            // 文件 / 图片气泡：始终排在正文（token）之后。
+            // 图片先渲染（位于文件卡片上方），随后紧跟其文件卡片（位于下方），二者点击均可下载；
+            // 非图片则只是普通文件卡片。
+            fileUrls.forEach { info ->
+                if (info.downloadUrl.isBlank()) return@forEach
+                if (info.isImage) {
+                    // 图片型 file：只展示图片预览气泡，不再展示文件卡片气泡
+                    add(ContentBlock.Image(remoteUrl = info.downloadUrl, fileName = info.filename))
+                } else {
+                    add(ContentBlock.File(remoteUrl = info.downloadUrl, fileName = info.filename))
+                }
             }
         }.ifEmpty { listOf(ContentBlock.Text("")) }
 
