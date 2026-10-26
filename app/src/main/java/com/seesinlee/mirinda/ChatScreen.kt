@@ -112,12 +112,14 @@ private fun stripInterruptions(blocks: List<ContentBlock>): StrippedBlocks {
         when (block) {
             is ContentBlock.Text -> {
                 val (t, label) = stripInterruption(block.text)
-                out.add(ContentBlock.Text(t))
+                out.add(ContentBlock.Text(t, block.isStreaming))
                 label?.let { if (it !in interrupts) interrupts.add(it) }
             }
             is ContentBlock.Reasoning -> {
                 val (t, label) = stripInterruption(block.text)
-                out.add(ContentBlock.Reasoning(t))
+                // 保留流式标记：否则 ReasoningPanel 永远拿到 isStreaming=false，
+                // 会一直显示折叠态的“已深度思考”，思考内容流式追加时无法自动展开。
+                out.add(ContentBlock.Reasoning(t, block.isStreaming))
                 label?.let { if (it !in interrupts) interrupts.add(it) }
             }
             is ContentBlock.Image -> out.add(block)
