@@ -42,6 +42,7 @@ import android.app.DownloadManager
 import android.content.Context
 import android.os.Environment
 import android.webkit.MimeTypeMap
+import android.widget.Toast
 import org.json.JSONArray
 import org.json.JSONObject
 import androidx.compose.material.icons.Icons
@@ -77,7 +78,9 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.launch
+import coil.Coil
 import coil.compose.AsyncImage
+import coil.request.CachePolicy
 import coil.request.ImageRequest
 
 /* ============================================================
@@ -686,6 +689,8 @@ fun AppDrawer(
 fun SettingsDialog(vm: ChatViewModel, onDismiss: () -> Unit) {
     // 本地编辑态，初始填入当前 token
     var input by remember { mutableStateOf(TextFieldValue(vm.token.value)) }
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -737,6 +742,27 @@ fun SettingsDialog(vm: ChatViewModel, onDismiss: () -> Unit) {
                     style = MaterialTheme.typography.labelSmall,
                     color = ChatColors.TextSecondary.copy(alpha = 0.7f)
                 )
+
+                Spacer(Modifier.height(14.dp))
+                HorizontalDivider(color = ChatColors.InputBorder)
+                Spacer(Modifier.height(10.dp))
+                // 图片缓存：长期存于 filesDir 下的磁盘缓存（重开 App 不重复请求），
+                // 用户主动点击"清理缓存"才清空，下次加载再回源。
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                Coil.imageLoader(context).diskCache?.clear()
+                                Toast.makeText(context, "图片缓存已清理", Toast.LENGTH_SHORT).show()
+                            }
+                        }
+                    ) {
+                        Text("清理缓存", color = ChatColors.Accent)
+                    }
+                }
             }
         },
         confirmButton = {
@@ -923,7 +949,7 @@ private fun UserBlockBubble(block: ContentBlock) {
                 }
             }
         }
-        is ContentBlock.Image -> ImageBubble(block)
+        is ContentBlock.Image -> ImageBubble(block, isUser = true)
         is ContentBlock.File -> FileBubble(block)
         is ContentBlock.Reasoning -> { /* 用户消息不含推理块，忽略 */ }
         is ContentBlock.ToolCall -> { /* 用户消息不含工具调用块，忽略 */ }
@@ -938,7 +964,7 @@ private fun UserBlockBubble(block: ContentBlock) {
  * 逻辑与 [FileBubble] 一致，仅展示形态不同（图片预览 vs 文件卡片）。
  */
 @Composable
-private fun ImageBubble(block: ContentBlock.Image) {
+private fun ImageBubble(block: ContentBlock.Image, isUser: Boolean = false) {
     val context = LocalContext.current
     val remoteUrl: String? = block.remoteUrl?.takeIf { it.isNotBlank() }
     val localUri = block.localUri
@@ -950,21 +976,32 @@ private fun ImageBubble(block: ContentBlock.Image) {
 
     val model: Any? = remoteUrl ?: localUri
     if (model != null) {
+        // 稳定缓存键：远程图用 URL、本地图用 Uri 字符串。
+        // 显式指定 memory/disk 缓存键，保证滚动出/入屏重组时 key 不变，命中缓存而非回源。
+        val cacheKey = remoteUrl ?: localUri?.toString().orEmpty()
         // 关键：限制解码尺寸（最长边 720px），避免历史里大图在全设备（尤其低配真机/模拟器）
         // 上因原图过大而 OOM 崩溃；远程/本地图统一走 Coil 的降采样与磁盘缓存。
-        val imageRequest = ImageRequest.Builder(LocalContext.current)
-            .data(model)
-            .size(720)
-            .crossfade(true)
-            .apply {
-                // 远程图片来自需要鉴权的后端 /file 接口：必须带上 x-user-token，
-                // 否则服务端返回 401，Coil 加载失败，气泡只剩空白占位。
-                if (remoteUrl != null) {
-                    val token = TokenStore.getToken()
-                    if (token.isNotBlank()) addHeader(ChatApi.HEADER_TOKEN, token)
+        // remember 包裹：避免每次重组都重建 ImageRequest（key 不变则复用）。
+        val imageRequest = remember(remoteUrl, localUri) {
+            ImageRequest.Builder(context)
+                .data(model)
+                .size(720)
+                .crossfade(true)
+                .memoryCacheKey(cacheKey)
+                .diskCacheKey(cacheKey)
+                .memoryCachePolicy(CachePolicy.ENABLED)
+                .diskCachePolicy(CachePolicy.ENABLED)
+                .networkCachePolicy(CachePolicy.ENABLED)
+                .apply {
+                    // 远程图片来自需要鉴权的后端 /file 接口：必须带上 x-user-token，
+                    // 否则服务端返回 401，Coil 加载失败，气泡只剩空白占位。
+                    if (remoteUrl != null) {
+                        val token = TokenStore.getToken()
+                        if (token.isNotBlank()) addHeader(ChatApi.HEADER_TOKEN, token)
+                    }
                 }
-            }
-            .build()
+                .build()
+        }
         // DisableSelection：助手消息整体包在 SelectionContainer 里（用于文字选择），
         // 会拦截子元素的点按手势；这里局部关闭选择，确保图片气泡的点击能正常触发。
         DisableSelection {
@@ -977,19 +1014,10 @@ private fun ImageBubble(block: ContentBlock.Image) {
                 .heightIn(max = 220.dp)
                 .clip(RoundedCornerShape(14.dp))
                 .then(
-                    if (remoteUrl != null || localUri != null) Modifier.clickable {
-                        if (remoteUrl != null) {
-                            // 远程图片：先弹出确认框，确认后再真正下载
-                            showDownloadDialog = true
-                        } else if (localUri != null) {
-                            // 本地图片（发送前预览）：直接以 ACTION_VIEW 打开
-                            runCatching {
-                                context.startActivity(
-                                    Intent(Intent.ACTION_VIEW, localUri)
-                                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                )
-                            }
-                        }
+                    // 仅 agent 生成的远程图片允许点击下载；用户上传的图片（含本地预览/历史）点击不下载
+                    if (!isUser && remoteUrl != null) Modifier.clickable {
+                        // 远程图片：先弹出确认框，确认后再真正下载
+                        showDownloadDialog = true
                     } else Modifier
                 )
         )
@@ -1595,7 +1623,8 @@ fun ReasoningPanel(text: String, thinking: Boolean) {
                         .fillMaxWidth()
                         .height(REASONING_THINKING_HEIGHT)
                         .padding(top = 8.dp)
-                        .verticalScroll(scrollState)
+                        // 思考中禁止用户手动滑动内容；程序化自动滚动（scrollTo）不受影响。
+                        .verticalScroll(scrollState, enabled = false)
                 ) {
                     Text(
                         text = text,
