@@ -8,6 +8,7 @@ import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.foundation.BorderStroke
@@ -1501,34 +1502,47 @@ fun TypingIndicator() {
 
 
 /**
+ * 思考中气泡的【固定高度】：流式输出期间内容在内部滚动，不随文本长度无限增高。
+ * 改这个值即可调整思考中气泡的视觉高度。
+ */
+private val REASONING_THINKING_HEIGHT = 120.dp
+
+/**
  * 深度思考面板（DeepSeek-R1 风格）。
  *
- * - thinking=true（仍在思考、正文还没来）：面板默认展开，标题显示"深度思考中…"并带转圈动效。
- * - thinking=false（正文已开始 / 已结束）：面板自动折叠成一行"已深度思考（点击展开）"，
- *   想回看思考过程点一下即可展开。
+ * - thinking=true（正在监听 agent 的 SSE 流式消息、仍在思考）：
+ *   气泡【固定高度】，思考内容在内部追加并通过 auto-scroll 形成"打字滚动"效果；
+ *   此阶段【不可点击展开】，只显示"深度思考中…"标题 + 转圈。
+ * - thinking=false（思考 / 整回合结束 / 历史消息）：
+ *   气泡默认【折叠】为一行"已深度思考（点击展开）"，点击后正常展示完整内容，
+ *   气泡高度随文本长度自适应（wrap 内容）。
  */
 @Composable
 fun ReasoningPanel(text: String, thinking: Boolean) {
-    // 展开状态：思考中默认展开；思考结束/历史消息默认折叠（仍可手动点开）。
-    // 初值直接取 thinking，避免“首帧展开(高) -> 随后折叠(矮)”的高度抖动，
-    // 否则进入历史会话时会按展开态算好滚动位置、随即折叠，导致停在“已深度思考”框处。
-    var expanded by remember { mutableStateOf(thinking) }
+    // 思考结束后的折叠/展开态：思考结束或历史消息都默认折叠，点击再展开。
+    // 初值取 false，避免进入历史会话时按展开态算好滚动位置、随即折叠导致停在面板处。
+    var expanded by remember { mutableStateOf(false) }
     LaunchedEffect(thinking) {
-        expanded = thinking
+        // 一旦思考结束（thinking=false）强制回到折叠态；思考中无需此态。
+        if (!thinking) expanded = false
     }
 
     Surface(
         shape = RoundedCornerShape(12.dp),
         color = ChatColors.ReasoningBg,
         border = BorderStroke(1.dp, ChatColors.ReasoningBorder),
-        modifier = Modifier.fillMaxWidth()
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                // 仅思考结束（非流式）后才允许点击折叠/展开；思考中禁止点击。
+                if (!thinking) Modifier.clickable { expanded = !expanded }
+                else Modifier
+            )
     ) {
         Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
-            // ---- 标题行（可点击折叠/展开）----
+            // ---- 标题行 ----
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { expanded = !expanded },
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (thinking) {
@@ -1553,24 +1567,53 @@ fun ReasoningPanel(text: String, thinking: Boolean) {
                     )
                 }
                 Spacer(Modifier.weight(1f))
-                Icon(
-                    imageVector = if (expanded) Icons.Filled.KeyboardArrowUp
-                    else Icons.Filled.KeyboardArrowDown,
-                    contentDescription = if (expanded) "收起" else "展开",
-                    tint = ChatColors.TextSecondary,
-                    modifier = Modifier.size(20.dp)
-                )
+                // 思考中不显示展开/折叠箭头（无内容可展开）；结束后才显示。
+                if (!thinking) {
+                    Icon(
+                        imageVector = if (expanded) Icons.Filled.KeyboardArrowUp
+                        else Icons.Filled.KeyboardArrowDown,
+                        contentDescription = if (expanded) "收起" else "展开",
+                        tint = ChatColors.TextSecondary,
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
             }
 
-            // ---- 思考正文（可折叠）----
-            AnimatedVisibility(visible = expanded) {
-                Column {
-                    Spacer(Modifier.height(8.dp))
+            // ---- 内容区 ----
+            if (thinking) {
+                // 固定高度容器：思考内容内部追加、自动滚到底，形成"打字滚动"效果。
+                val scrollState = rememberScrollState()
+                // 文本增长时跟随到底部；同时监听 maxValue，规避"文本已更新但布局尚未
+                // 重算导致 maxValue 滞后"的滚动不到位问题（两次 emit 兜底）。
+                LaunchedEffect(Unit) {
+                    snapshotFlow { text to scrollState.maxValue }.collect {
+                        scrollState.scrollTo(scrollState.maxValue)
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(REASONING_THINKING_HEIGHT)
+                        .padding(top = 8.dp)
+                        .verticalScroll(scrollState)
+                ) {
                     Text(
                         text = text,
                         color = ChatColors.ReasoningText,
                         style = MaterialTheme.typography.bodyMedium
                     )
+                }
+            } else {
+                // 思考结束：按折叠态展示，点击后 wrap 内容自适应高度。
+                AnimatedVisibility(visible = expanded) {
+                    Column {
+                        Spacer(Modifier.height(8.dp))
+                        Text(
+                            text = text,
+                            color = ChatColors.ReasoningText,
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
                 }
             }
         }
