@@ -37,7 +37,7 @@ object ChatApi {
     /**
      * 后端地址。
      */
-    private const val BASE_URL = "http://gs5956mf606.vicp.fun"
+    private const val BASE_URL = "http://example:80"
 
     /**
      * 由后端返回的 OBS key 拼出可访问的文件 URL。
